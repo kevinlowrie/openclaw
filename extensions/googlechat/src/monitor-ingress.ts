@@ -1,20 +1,14 @@
-// Googlechat plugin module owns raw webhook durable admission and draining.
+import { createStandardRawEventIngressMonitor } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import {
   createChannelIngressError,
-  createChannelIngressMonitor,
-  type ChannelIngressQueue,
   type ChannelIngressMonitorDeliveryResult,
   type ChannelIngressMonitorLifecycle,
 } from "openclaw/plugin-sdk/channel-outbound";
 import { isRecord } from "openclaw/plugin-sdk/channel-secret-basic-runtime";
 import { collectErrorGraphCandidates, formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import { GoogleChatEventPayloadError, parseGoogleChatInboundPayload } from "./monitor-event.js";
+import { parseGoogleChatInboundPayload } from "./monitor-event.js";
 import { getGoogleChatRuntime } from "./runtime.js";
 import type { GoogleChatEvent } from "./types.js";
-
-const GOOGLECHAT_INGRESS_PAYLOAD_VERSION = 1;
-const GOOGLECHAT_INGRESS_POLL_INTERVAL_MS = 500;
-const GOOGLECHAT_INGRESS_MAX_CONCURRENT_DELIVERIES = 8;
 
 type GoogleChatIngressPayload = {
   version: 1;
@@ -26,12 +20,13 @@ export type GoogleChatIngressLifecycle = Omit<
   "onAdoptionFinalizing"
 >;
 
-type GoogleChatIngressDispatchResult = ChannelIngressMonitorDeliveryResult;
-
 type GoogleChatIngressDispatch = (
   event: GoogleChatEvent,
   lifecycle: GoogleChatIngressLifecycle,
-) => Promise<GoogleChatIngressDispatchResult | void> | GoogleChatIngressDispatchResult | void;
+) =>
+  | Promise<ChannelIngressMonitorDeliveryResult | void>
+  | ChannelIngressMonitorDeliveryResult
+  | void;
 
 const GoogleChatIngressPermanentError = createChannelIngressError<
   "invalid-event" | "googlechat-auth"
@@ -97,12 +92,7 @@ function deserializeGoogleChatIngressEvent(rawEvent: string, claimedId: string):
 
 function normalizeClaimedGoogleChatEvent(raw: unknown, claimedId: string): GoogleChatEvent {
   try {
-    const parsed = parseGoogleChatInboundPayload(raw);
-    const eventType = parsed.event.type ?? parsed.event.eventType;
-    if (eventType !== "MESSAGE") {
-      throw new GoogleChatEventPayloadError();
-    }
-    return parsed.event;
+    return parseGoogleChatInboundPayload(raw);
   } catch (error) {
     throw new GoogleChatIngressPermanentError(
       "invalid-event",
@@ -130,27 +120,15 @@ function resolveGoogleChatIngressNonRetryableFailure(error: unknown) {
   return null;
 }
 
-export type GoogleChatIngressMonitor = {
-  receive: (
-    rawEvent: unknown,
-  ) => Promise<{ kind: "durable" | "ignored" } | { kind: "invalid"; message: string }>;
-  start: () => void;
-  stop: () => Promise<void>;
-  waitForIdle: () => Promise<void>;
-};
-
 export function createGoogleChatIngressMonitor(options: {
   accountId: string;
-  queue?: ChannelIngressQueue<GoogleChatIngressPayload>;
   dispatch: GoogleChatIngressDispatch;
   runtime: {
     error?: (message: string) => void;
     log?: (message: string) => void;
   };
-  pollIntervalMs?: number;
-  adoptionStallTimeoutMs?: number;
   abortSignal?: AbortSignal;
-}): GoogleChatIngressMonitor {
+}) {
   const serializeForIngress = (rawEvent: unknown): string => {
     if (!isRecord(rawEvent)) {
       throw new GoogleChatIngressPermanentError(
@@ -161,27 +139,16 @@ export function createGoogleChatIngressMonitor(options: {
     const durableEvent = { ...rawEvent };
     // Authentication is complete before admission; no Add-on authorization token is replay data.
     delete durableEvent.authorizationEventObject;
-    const serialized = JSON.stringify(durableEvent);
-    if (typeof serialized !== "string") {
-      throw new GoogleChatIngressPermanentError(
-        "invalid-event",
-        "Google Chat webhook envelope cannot be serialized.",
-      );
-    }
-    return serialized;
+    return JSON.stringify(durableEvent);
   };
 
-  const monitor = createChannelIngressMonitor<unknown, string, GoogleChatIngressPayload>({
-    queue:
-      options.queue ??
-      (() =>
-        getGoogleChatRuntime().state.openChannelIngressQueue<GoogleChatIngressPayload>({
-          accountId: options.accountId,
-        })),
-    inspect: (rawEvent) => inspectGoogleChatIngressEvent(rawEvent),
+  return createStandardRawEventIngressMonitor({
+    queue: () =>
+      getGoogleChatRuntime().state.openChannelIngressQueue<GoogleChatIngressPayload>({
+        accountId: options.accountId,
+      }),
+    inspect: inspectGoogleChatIngressEvent,
     payload: {
-      storage: "raw-event",
-      version: GOOGLECHAT_INGRESS_PAYLOAD_VERSION,
       serialize: serializeForIngress,
       deserialize: (rawEvent, { claim }) => deserializeGoogleChatIngressEvent(rawEvent, claim.id),
       createClaimError: (kind, claim) =>
@@ -194,46 +161,18 @@ export function createGoogleChatIngressMonitor(options: {
     },
     deliver: (rawEvent, lifecycle, claim) =>
       options.dispatch(normalizeClaimedGoogleChatEvent(rawEvent, claim.id), lifecycle),
-    pollIntervalMs: options.pollIntervalMs ?? GOOGLECHAT_INGRESS_POLL_INTERVAL_MS,
     // The webhook retry horizon must fit beneath the standard 30-day / 20k cap.
-    retention: "standard",
     drain: {
       resolveNonRetryableFailure: resolveGoogleChatIngressNonRetryableFailure,
-      startLimit: GOOGLECHAT_INGRESS_MAX_CONCURRENT_DELIVERIES,
-      ...(options.adoptionStallTimeoutMs === undefined
-        ? {}
-        : { adoptionStallTimeoutMs: options.adoptionStallTimeoutMs }),
       onLog: (message) => options.runtime.error?.(`googlechat: ${message}`),
     },
     ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
-    admissionMode: "while-running",
     createStoppedError: () => new Error("Google Chat ingress is stopped."),
     onError: (error) =>
       options.runtime.error?.(`googlechat ingress drain failed: ${formatErrorMessage(error)}`),
+    classifyAdmissionError: (error) =>
+      error instanceof GoogleChatIngressPermanentError ? error.message : undefined,
   });
-
-  return {
-    receive: async (rawEvent) => {
-      if (!monitor.isRunning()) {
-        throw new Error("Google Chat ingress is stopped.");
-      }
-      let facts: ReturnType<typeof inspectGoogleChatIngressEvent>;
-      try {
-        facts = inspectGoogleChatIngressEvent(rawEvent);
-      } catch (error) {
-        if (error instanceof GoogleChatIngressPermanentError) {
-          return { kind: "invalid", message: error.message };
-        }
-        throw error;
-      }
-      if (!facts) {
-        return { kind: "ignored" };
-      }
-      await monitor.admit(rawEvent, { facts });
-      return { kind: "durable" };
-    },
-    start: monitor.start,
-    stop: monitor.stop,
-    waitForIdle: monitor.waitForIdle,
-  };
 }
+
+export type GoogleChatIngressMonitor = ReturnType<typeof createGoogleChatIngressMonitor>;

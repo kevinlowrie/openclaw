@@ -1,480 +1,447 @@
-import type { ChildProcess } from "node:child_process";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { describe, expect, it, vi } from "vitest";
-import { CuaDriverClient } from "./driver-client.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { execution } from "./commands.test-helpers.js";
+import { cuaToolResult } from "./cua-driver-contract.test-fixtures.js";
 
-function fakeTransport(): Transport {
-  return {
-    start: vi.fn(async () => {}),
-    send: vi.fn(async () => {}),
-    close: vi.fn(async () => {}),
+const mocks = vi.hoisted(() => {
+  const state = async () => ({
+    session: "openclaw-test",
+    captureScope: "desktop",
+    effectiveScope: "desktop",
+    desktopCaptureAuthorized: true,
+    desktopUnlocked: true,
+  });
+  const session = {
+    callTool: vi.fn(async () => ({})),
+    click: vi.fn(async () => ({ effect: 0, route: 2 })),
+    close: vi.fn(),
+    drag: vi.fn(async () => ({})),
+    endSession: vi.fn(async () => ({})),
+    escalateSession: vi.fn(state),
+    getCursorPosition: vi.fn(async () => ({})),
+    getDesktopState: vi.fn(async () => ({})),
+    getSessionState: vi.fn(state),
+    moveCursor: vi.fn(async () => ({})),
+    pressKey: vi.fn(async () => ({})),
+    scroll: vi.fn(async () => ({})),
+    startSession: vi.fn(async () => ({})),
+    typeText: vi.fn(async () => ({})),
   };
-}
-
-function fakeClient(options: {
-  name?: string;
-  version?: string;
-  capabilityVersion?: string;
-  schemaVersion?: string;
-  connect?: () => Promise<void>;
-  result?: unknown;
-  callToolThrows?: boolean;
-}) {
   return {
-    connect: vi.fn(options.connect ?? (async () => {})),
-    getServerVersion: () => ({
-      name: options.name ?? "cua-driver",
-      version: options.version ?? "0.10.4",
-    }),
-    listTools: vi.fn(async () => ({
-      tools: [],
-      capability_version: options.capabilityVersion ?? "1",
-      schema_version: options.schemaVersion ?? "1",
+    ...session,
+    session,
+    create: vi.fn(),
+    createConfigured: vi.fn(),
+    createDesktopTarget: vi.fn(({ displayId }: { displayId: string }) => ({
+      tag: "Desktop",
+      inner: { displayId },
     })),
-    callTool: vi.fn(async () => {
-      if (options.callToolThrows) {
-        throw new Error("transport closed");
-      }
-      return options.result ?? { content: [{ type: "text", text: "ok" }] };
-    }),
-    close: vi.fn(async () => {}),
+    createClickPosition: vi.fn(({ x, y }: { x: number; y: number }) => ({
+      tag: "Coordinates",
+      inner: { x, y },
+    })),
+    createTrustedSession: vi.fn(),
+    isAvailable: vi.fn(() => true),
+    isToolError: vi.fn((_error: unknown) => false),
+    isShutdownError: vi.fn((_error: unknown) => false),
+    shutdown: vi.fn(async () => {}),
   };
-}
-
-function createClient(client: ReturnType<typeof fakeClient>) {
-  return new CuaDriverClient({
-    driverPath: "/opt/bin/cua-driver",
-    access: () => {},
-    clientFactory: () => client,
-    transportFactory: fakeTransport,
-  });
-}
-
-describe("CuaDriverClient version gate", () => {
-  it("accepts cua-driver 0.10.x with capability and schema version 1", async () => {
-    const driver = createClient(fakeClient({ version: "0.10.4" }));
-    await expect(driver.callTool("get_screen_size", {})).resolves.toMatchObject({
-      content: [{ type: "text", text: "ok" }],
-    });
-    expect(driver.generation).toBe(1);
-  });
-
-  it.each([
-    [{ version: "0.11.0" }, "cua-driver@0.11.0"],
-    [{ name: "other-driver" }, "other-driver@0.10.4"],
-    [{ capabilityVersion: "2" }, "capability_version=2"],
-    [{ schemaVersion: "2" }, "schema_version=2"],
-  ])("rejects unsupported initialize/list result %#", async (options, found) => {
-    const driver = createClient(fakeClient(options));
-    await expect(driver.callTool("get_screen_size", {})).rejects.toThrow(found);
-    expect(driver.isAvailable()).toBe(false);
-  });
-
-  it("re-probes and recovers after a corrected driver replaces an unsupported one", async () => {
-    const clients = [fakeClient({ version: "0.11.0" }), fakeClient({ version: "0.10.4" })];
-    let clock = 1_000;
-    const driver = new CuaDriverClient({
-      driverPath: "/opt/bin/cua-driver",
-      access: () => {},
-      clientFactory: () => clients.shift() ?? fakeClient({ version: "0.10.4" }),
-      transportFactory: fakeTransport,
-      now: () => clock,
-    });
-
-    await expect(driver.callTool("get_screen_size", {})).rejects.toThrow("cua-driver@0.11.0");
-    // Within the re-probe window the verdict is cached: unavailable, no reconnect.
-    clock += 10_000;
-    expect(driver.isAvailable()).toBe(false);
-    // After the window, the corrected driver is re-probed and accepted.
-    clock += 25_000;
-    expect(driver.isAvailable()).toBe(true);
-    await expect(driver.callTool("get_screen_size", {})).resolves.toMatchObject({
-      content: [{ type: "text", text: "ok" }],
-    });
-  });
 });
 
-describe("CuaDriverClient process contract", () => {
-  it("forwards only allowlisted env, opt-outs, and the Wayland setting, dropping secrets", async () => {
-    let transportParams: { env?: Record<string, string>; stderr?: unknown } | undefined;
-    const driver = new CuaDriverClient({
-      driverPath: "/opt/bin/cua-driver",
-      env: {
-        PATH: "/opt/bin",
-        DISPLAY: ":0",
-        XDG_RUNTIME_DIR: "/run/user/1000",
-        LC_ALL: "en_US.UTF-8",
-        CUA_DRIVER_RS_ENABLE_WAYLAND: "1",
-        OPENAI_API_KEY: "sk-should-not-leak",
-        ANTHROPIC_API_KEY: "should-not-leak",
-        SLACK_BOT_TOKEN: "xoxb-should-not-leak",
-        CUA_API_KEY: "cua-cloud-should-not-leak",
-      },
-      access: () => {},
-      clientFactory: () => fakeClient({}),
-      transportFactory: (params) => {
-        transportParams = params;
-        return fakeTransport();
-      },
-    });
+const sdk = {
+  ActionTarget: { Desktop: { new: mocks.createDesktopTarget } },
+  ClickPosition: { Coordinates: { new: mocks.createClickPosition } },
+  ClickButton: { Left: 0, Right: 1, Middle: 2 },
+  CuaDriver: { create: mocks.create, createConfigured: mocks.createConfigured },
+  DriverError: {
+    Tool: { instanceOf: mocks.isToolError },
+    Shutdown: { instanceOf: mocks.isShutdownError },
+  },
+  InputDeliveryMode: { Foreground: 1 },
+  ScrollBy: { Line: 0 },
+  ScrollDirection: { Up: 0, Down: 1, Left: 2, Right: 3 },
+  SessionPermissionMode: { Unrestricted: "unrestricted" },
+  createTrustedSession: mocks.createTrustedSession,
+};
 
-    await driver.callTool("get_screen_size", {});
+import { ClickButton, createCuaDriver, ScrollDirection } from "./driver-client.js";
 
-    expect(transportParams?.env).toMatchObject({
-      PATH: "/opt/bin",
-      DISPLAY: ":0",
-      XDG_RUNTIME_DIR: "/run/user/1000",
-      LC_ALL: "en_US.UTF-8",
-      CUA_DRIVER_RS_TELEMETRY_ENABLED: "false",
-      CUA_DRIVER_RS_UPDATE_CHECK: "false",
-      CUA_DRIVER_RS_ENABLE_WAYLAND: "1",
+const authorization = {
+  allowedModes: ["unrestricted"],
+  compatibilityMode: "unrestricted",
+  unrestrictedAcknowledged: true,
+  maxSessionTtlSeconds: 3_600n,
+  maxIdleTtlSeconds: 300n,
+};
+
+function expectCall(name: keyof typeof mocks, ...args: unknown[]) {
+  expect(mocks[name]).toHaveBeenCalledWith(...args);
+}
+
+function expectCalls(count: number, ...names: Array<keyof typeof mocks>) {
+  for (const name of names) {
+    expect(mocks[name]).toHaveBeenCalledTimes(count);
+  }
+}
+
+const drivers: ReturnType<typeof createCuaDriver>[] = [];
+let driver: ReturnType<typeof createCuaDriver>;
+function makeDriver(loadSdk = async () => sdk as never) {
+  const created = createCuaDriver({ loadSdk });
+  drivers.push(created);
+  return created;
+}
+const clickInput = { x: 20, y: 30, button: ClickButton.Left, count: 1 };
+const expired = (message = "Permission denied: authorization context expired") =>
+  Object.assign(new Error("DriverError.Tool"), {
+    inner: { tool: "get_session_state", errorCode: "permission_denied", message },
+  });
+async function prepareExpiry() {
+  await driver.prepareExecution?.();
+  mocks.isToolError.mockReturnValue(true);
+  mocks.getSessionState.mockRejectedValueOnce(expired());
+}
+
+describe("CUA Driver direct session", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.isToolError.mockReturnValue(false);
+    mocks.isShutdownError.mockReturnValue(false);
+    mocks.createConfigured.mockReturnValue({
+      isAvailable: mocks.isAvailable,
+      shutdown: mocks.shutdown,
     });
-    expect(transportParams?.env).not.toHaveProperty("OPENAI_API_KEY");
-    expect(transportParams?.env).not.toHaveProperty("ANTHROPIC_API_KEY");
-    expect(transportParams?.env).not.toHaveProperty("SLACK_BOT_TOKEN");
-    // The CUA_ namespace holds cloud credentials, so it is not prefix-allowed.
-    expect(transportParams?.env).not.toHaveProperty("CUA_API_KEY");
-    expect(transportParams?.stderr).toBe("ignore");
+    mocks.createTrustedSession.mockReturnValue(mocks.session);
+    driver = makeDriver();
+  });
+  afterEach(async () => {
+    for (const created of drivers.splice(0)) {
+      await created.dispose();
+    }
   });
 
-  it("starts serve and connects on the first readiness poll", async () => {
-    const first = fakeClient({
-      connect: async () => {
-        throw new Error("daemon absent");
-      },
-    });
-    const second = fakeClient({});
-    const clients = [first, second];
-    const kill = vi.fn();
-    const child = {
-      exitCode: null,
-      once: vi.fn(),
-      unref: vi.fn(),
-      kill,
-    } as unknown as ChildProcess;
-    const spawnProcess = vi.fn(() => child);
-    const driver = new CuaDriverClient({
-      driverPath: "/opt/bin/cua-driver",
-      env: { PATH: "/opt/bin" },
-      access: () => {},
-      clientFactory: () => clients.shift() ?? second,
-      transportFactory: fakeTransport,
-      spawn: spawnProcess as unknown as typeof import("node:child_process").spawn,
-      sleep: async () => {},
-    });
+  it("matches the installed CUA Driver desktop input enum contract", async () => {
+    const driverSdk = await import("@trycua/cua-driver");
 
-    await driver.callTool("get_screen_size", {});
-    expect(spawnProcess).toHaveBeenCalledWith(
-      "/opt/bin/cua-driver",
-      ["serve"],
+    expect(ClickButton).toEqual({
+      Left: driverSdk.ClickButton.Left,
+      Right: driverSdk.ClickButton.Right,
+      Middle: driverSdk.ClickButton.Middle,
+    });
+    expect(ScrollDirection).toEqual({
+      Up: driverSdk.ScrollDirection.Up,
+      Down: driverSdk.ScrollDirection.Down,
+      Left: driverSdk.ScrollDirection.Left,
+      Right: driverSdk.ScrollDirection.Right,
+    });
+  });
+
+  it("uses configured creation with one trusted lifecycle session", async () => {
+    await driver.prepareAvailability?.();
+    expect(driver.isAvailable()).toBe(true);
+    expect(mocks.create).not.toHaveBeenCalled();
+    expectCall("createConfigured", { claudeCodeCompatibility: false, authorization });
+    expectCalls(1, "createTrustedSession");
+    expectCall(
+      "createTrustedSession",
+      expect.anything(),
       expect.objectContaining({
-        detached: true,
-        env: expect.objectContaining({
-          CUA_DRIVER_RS_TELEMETRY_ENABLED: "false",
-          CUA_DRIVER_RS_UPDATE_CHECK: "false",
-        }),
+        publicSession: expect.stringMatching(/^openclaw-/),
+        mode: "unrestricted",
+        ttlSeconds: authorization.maxSessionTtlSeconds,
+        idleTtlSeconds: authorization.maxIdleTtlSeconds,
       }),
     );
+
     await driver.dispose();
-    // The shared machine daemon must outlive our client; dispose closes the mcp
-    // session but never kills serve, so other cua-driver clients stay connected.
-    expect(kill).not.toHaveBeenCalled();
+    await driver.dispose();
+    expectCalls(1, "close", "shutdown");
   });
 
-  it("keeps polling through a slow daemon start and records the backoff delays", async () => {
-    const failing = () =>
-      fakeClient({
-        connect: async () => {
-          throw new Error("daemon still starting");
+  it("starts the shared lifecycle session once before using driver tools", async () => {
+    await Promise.all([driver.getDesktopState(), driver.callTool("list_windows", {})]);
+    const sessionOptions = mocks.createTrustedSession.mock.calls[0]?.[1];
+
+    expectCalls(1, "startSession");
+    expectCall("startSession", { session: sessionOptions.publicSession }, undefined);
+    expectCalls(1, "getDesktopState");
+    expectCall(
+      "callTool",
+      "list_windows",
+      JSON.stringify({ session: sessionOptions.publicSession }),
+      undefined,
+    );
+
+    await driver.dispose();
+    expectCalls(1, "endSession");
+    expectCall("endSession", { session: sessionOptions.publicSession });
+  });
+
+  it("targets desktop input while keeping the global cursor read untargeted", async () => {
+    const clicked = await driver.click(clickInput);
+    expect(clicked).toMatchObject({ isError: false, action: { effect: 0, route: 2 } });
+    await driver.drag({ fromX: 1, fromY: 2, toX: 3, toY: 4, durationMs: 5n });
+    await driver.moveCursor({ x: 6, y: 7 });
+    await driver.scroll({ x: 8, y: 9, direction: ScrollDirection.Down, amount: 3n });
+    await driver.typeText("hello");
+    await driver.pressKey({ key: "a", modifiers: ["cmd"] });
+    await driver.getCursorPosition();
+    await driver.getSessionState();
+
+    const sessionOptions = mocks.createTrustedSession.mock.calls[0]?.[1];
+    const target = { tag: "Desktop", inner: { displayId: "primary" } };
+    expectCalls(1, "createDesktopTarget");
+    expectCall("createDesktopTarget", { displayId: "primary" });
+    const expectedInputs = [
+      [
+        mocks.click,
+        {
+          position: { tag: "Coordinates", inner: { x: 20, y: 30 } },
+          deliveryMode: 1,
+          button: ClickButton.Left,
+          count: 1,
         },
+      ],
+      [mocks.drag, { fromX: 1, fromY: 2, toX: 3, toY: 4, durationMs: 5n }],
+      [mocks.moveCursor, { x: 6, y: 7 }],
+      [mocks.scroll, { x: 8, y: 9, direction: ScrollDirection.Down, amount: 3n, by: 0 }],
+      [mocks.typeText, { text: "hello" }],
+      [mocks.pressKey, { key: "a", modifiers: ["cmd"] }],
+    ] as const;
+    for (const [mock, input] of expectedInputs) {
+      expect(mock).toHaveBeenCalledWith({ ...input, target }, undefined);
+    }
+    expectCall("getCursorPosition", { session: sessionOptions.publicSession }, undefined);
+    expectCall("getSessionState", { session: sessionOptions.publicSession }, undefined);
+    expect(mocks.escalateSession).not.toHaveBeenCalled();
+  });
+
+  it("preserves typed SDK click refusals in the shared driver result", async () => {
+    const { DriverError } = await import("@trycua/cua-driver");
+    const refusal = DriverError.Tool.new({
+      tool: "click",
+      message: "desktop input is unavailable",
+      errorCode: "desktop_unavailable",
+    });
+    mocks.isToolError.mockImplementation((error) => DriverError.Tool.instanceOf(error));
+    mocks.click.mockRejectedValueOnce(refusal);
+    await expect(driver.click(clickInput)).resolves.toMatchObject({
+      isError: true,
+      errorCode: "desktop_unavailable",
+      text: "desktop input is unavailable",
+    });
+    const transportError = new Error("transport disconnected");
+    mocks.click.mockRejectedValueOnce(transportError);
+    await expect(driver.click(clickInput)).rejects.toBe(transportError);
+  });
+
+  it("awaits an ESM driver before the first availability declaration without starting an execution", async () => {
+    const loading = Promise.withResolvers<typeof sdk>();
+    const loadSdk = vi.fn(() => loading.promise as never);
+    driver = makeDriver(loadSdk);
+
+    const preparing = driver.prepareAvailability?.();
+    expect(loadSdk).toHaveBeenCalledOnce();
+
+    loading.resolve(sdk);
+    await preparing;
+    expect(driver.isAvailable()).toBe(true);
+    expect(mocks.startSession).not.toHaveBeenCalled();
+    await driver.getDesktopState();
+
+    expect(loadSdk).toHaveBeenCalledOnce();
+    expectCalls(1, "createConfigured", "getDesktopState");
+  });
+
+  it("retries an asynchronous ESM import failure after the availability cache resets", async () => {
+    const loadSdk = vi
+      .fn(async () => sdk as never)
+      .mockRejectedValueOnce(new Error("native module is temporarily unavailable"));
+    driver = makeDriver(loadSdk);
+
+    expect(loadSdk).not.toHaveBeenCalled();
+    expect(driver.isAvailable()).toBe(false);
+    expect(loadSdk).toHaveBeenCalledOnce();
+    await driver.prepareAvailability?.();
+    expect(driver.isAvailable()).toBe(false);
+    for (const read of [() => driver.getDesktopState(), () => driver.getScreenSize()]) {
+      await expect(read()).rejects.toThrow(
+        "COMPUTER_DRIVER_UNAVAILABLE: failed to load CUA Driver SDK: native module is temporarily unavailable",
+      );
+    }
+    expect(loadSdk).toHaveBeenCalledOnce();
+
+    driver.resetAvailabilityCache();
+    expect(driver.isAvailable()).toBe(false);
+    await driver.prepareAvailability?.();
+    expect(driver.isAvailable()).toBe(true);
+
+    expect(loadSdk).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-establishes an expired session on the next provider action without replaying input", async () => {
+    const computer = await execution(driver);
+    mocks.getCursorPosition.mockResolvedValueOnce(cuaToolResult({ x: 10, y: 20 }));
+    await computer.send("get_cursor_position");
+    const generation = driver.generation;
+    mocks.isToolError.mockReturnValue(true);
+    mocks.getSessionState.mockRejectedValueOnce(expired());
+    mocks.endSession.mockRejectedValueOnce(expired());
+
+    mocks.typeText.mockResolvedValueOnce(cuaToolResult({}));
+    expect(JSON.parse(await computer.send("type", { text: "hello" }))).toMatchObject({
+      ok: true,
+    });
+    expect(driver.generation).not.toBe(generation);
+    expectCalls(2, "createConfigured");
+    expect(mocks.createConfigured).toHaveBeenNthCalledWith(2, {
+      claudeCodeCompatibility: false,
+      authorization,
+    });
+    expectCalls(2, "createTrustedSession");
+    const first = mocks.createTrustedSession.mock.calls[0]?.[1];
+    const second = mocks.createTrustedSession.mock.calls[1]?.[1];
+    expect(second).toMatchObject({ ttlSeconds: 3_600n, idleTtlSeconds: 300n });
+    expect(second.publicSession).not.toBe(first.publicSession);
+    expectCalls(1, "close", "shutdown", "typeText");
+    await computer.close("completion");
+  });
+
+  it("does not renew a real permission denial and exposes its structured cause", async () => {
+    const computer = await execution(driver);
+    await driver.prepareExecution?.();
+    const generation = driver.generation;
+    const denied = expired("Desktop scope denied");
+    mocks.isToolError.mockReturnValue(true);
+    mocks.getSessionState.mockRejectedValueOnce(denied);
+    await expect(computer.send("type", { text: "must not type" })).rejects.toMatchObject({
+      message: "CUA_DRIVER_TOOL_ERROR: get_session_state: Desktop scope denied (permission_denied)",
+      cause: denied,
+    });
+    expect(driver.generation).toBe(generation);
+    expectCalls(1, "createConfigured");
+    expect(mocks.close).not.toHaveBeenCalled();
+    expect(mocks.typeText).not.toHaveBeenCalled();
+    await computer.close("completion");
+  });
+
+  it("shares concurrent preparation and performs at most one replacement", async () => {
+    await prepareExpiry();
+    await Promise.all([driver.prepareExecution?.(), driver.prepareExecution?.()]);
+    expectCalls(2, "createConfigured");
+    expectCalls(3, "getSessionState");
+    const generation = driver.generation;
+    await driver.prepareExecution?.();
+    expect(driver.generation).toBe(generation);
+    expectCalls(2, "createConfigured");
+  });
+
+  it.each(["disposal", "cancellation", "revocation"] as const)(
+    "does not reopen when %s interrupts expired-session cleanup",
+    async (interruption) => {
+      await prepareExpiry();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      mocks.endSession.mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        throw expired();
       });
-    const clients = [failing(), failing(), failing(), fakeClient({})];
-    const delays: number[] = [];
-    const child = {
-      exitCode: null,
-      once: vi.fn(),
-      unref: vi.fn(),
-      kill: vi.fn(),
-    } as unknown as ChildProcess;
-    const driver = new CuaDriverClient({
-      driverPath: "/opt/bin/cua-driver",
-      env: { PATH: "/opt/bin" },
-      access: () => {},
-      clientFactory: () => clients.shift() ?? fakeClient({}),
-      transportFactory: fakeTransport,
-      spawn: vi.fn(() => child) as unknown as typeof import("node:child_process").spawn,
-      sleep: async (durationMs) => {
-        delays.push(durationMs);
-      },
-    });
+      const controller = new AbortController();
+      let admitted = true;
+      const preparing = driver.prepareExecution?.(controller.signal, () => {
+        if (!admitted) {
+          throw new Error("owning execution revoked");
+        }
+      });
+      const rejected = expect(preparing).rejects.toThrow(/stopping|cancelled|revoked/);
+      await entered.promise;
+      const disposal = interruption === "disposal" ? driver.dispose() : undefined;
+      if (interruption === "cancellation") {
+        controller.abort(new Error("cancelled"));
+      }
+      admitted = interruption !== "revocation";
+      release.resolve();
+      await rejected;
+      await disposal;
+      expectCalls(1, "createConfigured", "close", "shutdown");
+      if (interruption === "cancellation") {
+        await driver.prepareExecution?.();
+        expectCalls(2, "createConfigured");
+      }
+    },
+  );
 
-    await driver.callTool("get_screen_size", {});
-    expect(delays).toEqual([250, 500, 1_000]);
+  it("reports failed expired-session cleanup and recovers on the next provider action", async () => {
+    const computer = await execution(driver);
+    await driver.prepareExecution?.();
+    const generation = driver.generation;
+    const denied = expired("Desktop scope denied");
+    mocks.isToolError.mockReturnValue(true);
+    mocks.getSessionState.mockRejectedValueOnce(expired());
+    mocks.endSession.mockRejectedValueOnce(denied);
+    const action = '{"action":"type","text":"hello"}';
+    await expect(computer.act(action)).rejects.toBe(denied);
+    expect(driver.generation).not.toBe(generation);
+    expectCalls(1, "close", "shutdown");
+    expect(mocks.typeText).not.toHaveBeenCalled();
+    mocks.typeText.mockResolvedValueOnce(cuaToolResult({}));
+    expect(JSON.parse(await computer.act(action))).toMatchObject({ ok: true });
+    expectCalls(1, "typeText");
+    await computer.close("completion");
   });
 
-  it("keeps polling the full budget even after the spawned child exits", async () => {
-    const delays: number[] = [];
-    const child = {
-      exitCode: null,
-      once: vi.fn(),
-      unref: vi.fn(),
-      kill: vi.fn(),
-    } as unknown as ChildProcess;
-    const driver = new CuaDriverClient({
-      driverPath: "/opt/bin/cua-driver",
-      env: { PATH: "/opt/bin" },
-      access: () => {},
-      clientFactory: () =>
-        fakeClient({
-          connect: async () => {
-            throw new Error("daemon absent");
-          },
-        }),
-      transportFactory: fakeTransport,
-      spawn: vi.fn(() => child) as unknown as typeof import("node:child_process").spawn,
-      sleep: async (durationMs) => {
-        delays.push(durationMs);
-        (child as { exitCode: number | null }).exitCode = 3;
-      },
+  it("does not loop if the replacement session also refuses authority", async () => {
+    await driver.prepareExecution?.();
+    mocks.isToolError.mockReturnValue(true);
+    const refusal = expired();
+    mocks.getSessionState.mockRejectedValueOnce(expired()).mockRejectedValueOnce(refusal);
+    await expect(driver.prepareExecution?.()).rejects.toMatchObject({
+      message:
+        "CUA_DRIVER_TOOL_ERROR: get_session_state: Permission denied: authorization context expired (permission_denied)",
+      cause: refusal,
     });
-
-    await expect(driver.callTool("get_screen_size", {})).rejects.toThrow(
-      /COMPUTER_DRIVER_UNAVAILABLE: cua-driver daemon did not become ready in time/,
-    );
-    // Child exit must not short-circuit the schedule.
-    expect(delays).toEqual([250, 500, 1_000, 2_000, 3_000, 3_000]);
+    expectCalls(2, "createConfigured");
   });
-
-  it("respawns the daemon when the remembered child was signal-terminated", async () => {
-    // Two connect cycles: cycle 1 spawns child0 and caches a session whose
-    // callTool then breaks; cycle 2 must spawn again because child0 was killed
-    // by signal (exitCode null, signalCode set) rather than a clean exit.
-    const clients = [
-      fakeClient({
-        connect: async () => {
-          throw new Error("daemon absent");
-        },
+  it("does not admit native authority for an already-revoked owner", async () => {
+    await expect(
+      driver.prepareExecution?.(undefined, () => {
+        throw new Error("owning execution revoked");
       }),
-      fakeClient({ callToolThrows: true }),
-      fakeClient({
-        connect: async () => {
-          throw new Error("daemon absent");
-        },
-      }),
-      fakeClient({}),
-    ];
-    const spawned: Array<{ signalCode: string | null; exitCode: number | null }> = [];
-    const spawnProcess = vi.fn(() => {
-      const child = {
-        exitCode: null,
-        signalCode: null,
-        once: vi.fn(),
-        unref: vi.fn(),
-        kill: vi.fn(),
-      };
-      spawned.push(child);
-      return child as unknown as ChildProcess;
-    });
-    const driver = new CuaDriverClient({
-      driverPath: "/opt/bin/cua-driver",
-      env: { PATH: "/opt/bin" },
-      access: () => {},
-      clientFactory: () => clients.shift() ?? fakeClient({}),
-      transportFactory: fakeTransport,
-      spawn: spawnProcess as unknown as typeof import("node:child_process").spawn,
-      sleep: async () => {},
-    });
-
-    await expect(driver.callTool("get_screen_size", {})).rejects.toThrow("transport closed");
-    const firstChild = spawned[0];
-    expect(firstChild).toBeDefined();
-    firstChild!.signalCode = "SIGKILL";
-    await expect(driver.callTool("get_desktop_state", {})).resolves.toBeDefined();
-    expect(spawnProcess).toHaveBeenCalledTimes(2);
+    ).rejects.toThrow("owning execution revoked");
+    expect(mocks.createConfigured).not.toHaveBeenCalled();
+    expect(mocks.startSession).not.toHaveBeenCalled();
   });
 
-  it("respawns after the spawned child emits an async spawn error", async () => {
-    // `error` can fire without `exit`, leaving exitCode/signalCode null; the
-    // handler must still forget the child so the next connect respawns.
-    const clients = [
-      fakeClient({
-        connect: async () => {
-          throw new Error("daemon absent");
-        },
-      }),
-      fakeClient({ callToolThrows: true }),
-      fakeClient({
-        connect: async () => {
-          throw new Error("daemon absent");
-        },
-      }),
-      fakeClient({}),
-    ];
-    const errorHandlers: Array<() => void> = [];
-    const spawnProcess = vi.fn(() => {
-      const child = {
-        exitCode: null,
-        signalCode: null,
-        unref: vi.fn(),
-        kill: vi.fn(),
-        once: (event: string, cb: () => void) => {
-          if (event === "error") {
-            errorHandlers.push(cb);
-          }
-        },
-      };
-      return child as unknown as ChildProcess;
+  it("does not start a native session when the execution closes during SDK loading", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    driver = makeDriver(async () => {
+      entered.resolve();
+      await release.promise;
+      return sdk as never;
     });
-    const driver = new CuaDriverClient({
-      driverPath: "/opt/bin/cua-driver",
-      env: { PATH: "/opt/bin" },
-      access: () => {},
-      clientFactory: () => clients.shift() ?? fakeClient({}),
-      transportFactory: fakeTransport,
-      spawn: spawnProcess as unknown as typeof import("node:child_process").spawn,
-      sleep: async () => {},
-    });
-
-    await expect(driver.callTool("get_screen_size", {})).rejects.toThrow("transport closed");
-    errorHandlers[0]?.();
-    await expect(driver.callTool("get_desktop_state", {})).resolves.toBeDefined();
-    expect(spawnProcess).toHaveBeenCalledTimes(2);
+    const computer = await execution(driver);
+    const acting = computer.send("type", { text: "must not type" });
+    const rejected = expect(acting).rejects.toThrow("provider execution is closing");
+    await entered.promise;
+    const closing = computer.close("cancelled");
+    release.resolve();
+    await rejected;
+    await closing;
+    expect(mocks.startSession).not.toHaveBeenCalled();
+    expect(mocks.typeText).not.toHaveBeenCalled();
   });
 
-  it("connects to a shared daemon even when our serve child lost the startup race", async () => {
-    const clients = [
-      fakeClient({
-        connect: async () => {
-          throw new Error("daemon absent");
-        },
-      }),
-      fakeClient({}),
-    ];
-    const child = {
-      exitCode: null,
-      once: vi.fn(),
-      unref: vi.fn(),
-      kill: vi.fn(),
-    } as unknown as ChildProcess;
-    const driver = new CuaDriverClient({
-      driverPath: "/opt/bin/cua-driver",
-      env: { PATH: "/opt/bin" },
-      access: () => {},
-      clientFactory: () => clients.shift() ?? fakeClient({}),
-      transportFactory: fakeTransport,
-      spawn: vi.fn(() => child) as unknown as typeof import("node:child_process").spawn,
-      // Our serve child exited (another client won the race), but the shared
-      // daemon it collided with is now serving; the retry must still connect.
-      sleep: async () => {
-        (child as { exitCode: number | null }).exitCode = 1;
-      },
-    });
-
-    await expect(driver.callTool("get_screen_size", {})).resolves.toBeDefined();
-  });
-
-  it("gives up with a readiness timeout after exhausting the backoff schedule", async () => {
-    const delays: number[] = [];
-    const child = {
-      exitCode: null,
-      once: vi.fn(),
-      unref: vi.fn(),
-      kill: vi.fn(),
-    } as unknown as ChildProcess;
-    const driver = new CuaDriverClient({
-      driverPath: "/opt/bin/cua-driver",
-      env: { PATH: "/opt/bin" },
-      access: () => {},
-      clientFactory: () =>
-        fakeClient({
-          connect: async () => {
-            throw new Error("daemon never ready");
-          },
-        }),
-      transportFactory: fakeTransport,
-      spawn: vi.fn(() => child) as unknown as typeof import("node:child_process").spawn,
-      sleep: async (durationMs) => {
-        delays.push(durationMs);
-      },
-    });
-
-    await expect(driver.callTool("get_screen_size", {})).rejects.toThrow(
-      /COMPUTER_DRIVER_UNAVAILABLE: cua-driver daemon did not become ready in time/,
-    );
-    expect(delays).toEqual([250, 500, 1_000, 2_000, 3_000, 3_000]);
-  });
-
-  it("closes a connection that completes after disposal starts", async () => {
-    let finishConnect = () => {};
-    const connecting = new Promise<void>((resolve) => {
-      finishConnect = resolve;
-    });
-    const client = fakeClient({ connect: async () => await connecting });
-    const driver = createClient(client);
-
-    const call = driver.callTool("get_screen_size", {});
-    const disposal = driver.dispose();
-    finishConnect();
-
-    await expect(call).rejects.toThrow("cua-driver client is disposed");
-    await disposal;
-    expect(client.callTool).not.toHaveBeenCalled();
-    expect(client.close).toHaveBeenCalled();
-    expect(driver.isAvailable()).toBe(false);
-  });
-
-  it("caches binary resolution for one second", () => {
-    let now = 0;
-    const access = vi.fn(() => {});
-    const driver = new CuaDriverClient({
-      env: { PATH: "/one:/two" },
-      now: () => now,
-      access,
-    });
-    expect(driver.isAvailable()).toBe(true);
-    expect(driver.isAvailable()).toBe(true);
-    expect(access).toHaveBeenCalledTimes(1);
-    now = 1_001;
-    expect(driver.isAvailable()).toBe(true);
-    expect(access).toHaveBeenCalledTimes(2);
-  });
-
-  it("reports unavailable when the binary cannot be resolved", () => {
-    const driver = new CuaDriverClient({
-      env: { PATH: "/missing" },
-      access: () => {
-        throw new Error("ENOENT");
-      },
-    });
-    expect(driver.isAvailable()).toBe(false);
-  });
-});
-
-describe("CuaDriverClient refusal mapping", () => {
-  it("uses a structured refusal code and the first text block", async () => {
-    const driver = createClient(
-      fakeClient({
-        result: {
-          isError: true,
-          content: [
-            { type: "text", text: "desktop unavailable" },
-            { type: "text", text: "ignored" },
-          ],
-          structuredContent: { code: "background_unavailable" },
-        },
-      }),
-    );
-    await expect(driver.callTool("click", {})).rejects.toThrow(
-      "COMPUTER_REFUSED_background_unavailable: desktop unavailable",
-    );
-  });
-
-  it("falls back to the generic driver error prefix", async () => {
-    const driver = createClient(
-      fakeClient({
-        result: { isError: true, content: [{ type: "text", text: "bad input" }] },
-      }),
-    );
-    await expect(driver.callTool("click", {})).rejects.toThrow("COMPUTER_DRIVER_ERROR: bad input");
+  it("does not renew a terminally revoked native session and still releases its runtime", async () => {
+    await driver.prepareExecution?.();
+    const shutdown = new Error("DriverError.Shutdown");
+    mocks.isShutdownError.mockImplementation((error) => error === shutdown);
+    mocks.getSessionState.mockRejectedValueOnce(shutdown);
+    await expect(driver.prepareExecution?.()).rejects.toBe(shutdown);
+    expectCalls(1, "createConfigured");
+    expect(mocks.click).not.toHaveBeenCalled();
+    mocks.endSession.mockRejectedValueOnce(shutdown);
+    await expect(driver.dispose()).resolves.toBeUndefined();
+    expectCalls(1, "close", "shutdown");
   });
 });

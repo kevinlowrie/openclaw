@@ -1,121 +1,123 @@
-// Tests for terminal runtime helpers.
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Mock dependencies
 vi.mock("../packages/terminal-core/src/progress-line.js", () => ({
   clearActiveProgressLine: vi.fn(),
 }));
 
-vi.mock("../packages/terminal-core/src/restore.js", () => ({
-  restoreTerminalState: vi.fn(),
-}));
-
+import { loggingState } from "./logging/state.js";
 import {
   createNonExitingRuntime,
+  defaultRuntime,
   ExitError,
   writeRuntimeJson,
   writeRuntimeStdout,
 } from "./runtime.js";
 
-describe("createNonExitingRuntime", () => {
-  it("returns runtime with exit function", () => {
-    const runtime = createNonExitingRuntime();
-    expect(typeof runtime.exit).toBe("function");
-  });
+const makeRuntime = () => ({ log: vi.fn(), error: vi.fn(), exit: vi.fn() });
+const makeOutputRuntime = () => ({ ...makeRuntime(), writeStdout: vi.fn(), writeJson: vi.fn() });
 
-  it("exit function throws ExitError", () => {
-    const runtime = createNonExitingRuntime();
-    expect(() => runtime.exit(1)).toThrow(ExitError);
-  });
-
-  it("ExitError includes exit code", () => {
-    const runtime = createNonExitingRuntime();
-    expect(() => runtime.exit(42)).toThrow("exit 42");
-    expect(() => runtime.exit(42)).toThrow(ExitError);
-  });
-
-  it("ExitError is distinguishable from generic Error", () => {
-    const runtime = createNonExitingRuntime();
-    try {
-      runtime.exit(1);
-    } catch (err) {
-      expect(err instanceof ExitError).toBe(true);
-      expect(err instanceof Error).toBe(true);
-    }
-  });
+it("throws a typed exit error carrying the requested code", () => {
+  let thrown: unknown;
+  try {
+    createNonExitingRuntime().exit(42);
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(ExitError);
+  expect(thrown).toBeInstanceOf(Error);
+  expect(thrown).toMatchObject({ name: "ExitError", message: "exit 42", code: 42 });
 });
 
-describe("writeRuntimeJson", () => {
-  it("writes JSON using writeJson when available", () => {
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-      writeStdout: vi.fn(),
-      writeJson: vi.fn(),
-    };
-    writeRuntimeJson(runtime, { key: "value" });
-    expect(runtime.writeJson).toHaveBeenCalledWith({ key: "value" }, 2);
-  });
-
-  it("writes JSON using log when writeJson not available", () => {
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
-    writeRuntimeJson(runtime, { key: "value" });
-    expect(runtime.log).toHaveBeenCalled();
-  });
-
-  it("uses custom space parameter", () => {
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-      writeStdout: vi.fn(),
-      writeJson: vi.fn(),
-    };
-    writeRuntimeJson(runtime, { key: "value" }, 4);
-    expect(runtime.writeJson).toHaveBeenCalledWith({ key: "value" }, 4);
-  });
-
-  it("handles zero space parameter", () => {
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
-    writeRuntimeJson(runtime, { key: "value" }, 0);
-    expect(runtime.log).toHaveBeenCalledWith('{"key":"value"}');
-  });
+it.each([
+  [true, undefined, { key: "value" }],
+  [false, undefined, '{\n  "key": "value"\n}'],
+  [false, 0, '{"key":"value"}'],
+] as const)("writes JSON (direct: %s, space: %s)", (direct, space, expected) => {
+  const runtime = direct ? makeOutputRuntime() : makeRuntime();
+  writeRuntimeJson(runtime, { key: "value" }, space);
+  if ("writeJson" in runtime) {
+    expect(runtime.writeJson).toHaveBeenCalledWith(expected, 2);
+  } else {
+    expect(runtime.log).toHaveBeenCalledWith(expected);
+  }
 });
 
-describe("writeRuntimeStdout", () => {
-  it("uses the direct stdout writer when available", () => {
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-      writeStdout: vi.fn(),
-      writeJson: vi.fn(),
-    };
-
-    writeRuntimeStdout(runtime, "plain output");
-
+it.each([false, true])("writes stdout (direct writer: %s)", (direct) => {
+  const runtime = direct ? makeOutputRuntime() : makeRuntime();
+  writeRuntimeStdout(runtime, "plain output");
+  if ("writeStdout" in runtime) {
     expect(runtime.writeStdout).toHaveBeenCalledWith("plain output");
     expect(runtime.log).not.toHaveBeenCalled();
+  } else {
+    expect(runtime.log).toHaveBeenCalledWith("plain output");
+  }
+});
+
+describe("defaultRuntime terminal restoration", () => {
+  const originalForceConsoleToStderr = loggingState.forceConsoleToStderr;
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const streams = [
+    { stream: process.stdout, chunks: stdout },
+    { stream: process.stderr, chunks: stderr },
+  ].map(({ stream, chunks }) => ({
+    stream,
+    chunks,
+    isTTY: Object.getOwnPropertyDescriptor(stream, "isTTY"),
+  }));
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    loggingState.forceConsoleToStderr = originalForceConsoleToStderr;
+    for (const { stream, isTTY } of streams) {
+      if (isTTY) {
+        Object.defineProperty(stream, "isTTY", isTTY);
+      } else {
+        Reflect.deleteProperty(stream, "isTTY");
+      }
+    }
   });
 
-  it("falls back to the runtime logger when no stdout writer is available", () => {
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+  beforeEach(() => {
+    for (const { stream, chunks } of streams) {
+      Object.defineProperty(stream, "isTTY", { value: true, configurable: true });
+      chunks.length = 0;
+      vi.spyOn(stream, "write").mockImplementation((chunk) => {
+        chunks.push(String(chunk));
+        return true;
+      });
+    }
+    vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("forced native exit");
+    });
+  });
 
-    writeRuntimeStdout(runtime, "plain output");
+  it.each([false, true])("restores the terminal without corrupting output (JSON: %s)", (json) => {
+    loggingState.forceConsoleToStderr = json;
+    if (json) {
+      defaultRuntime.writeJson({ ok: false });
+    } else {
+      defaultRuntime.writeStdout("operator-visible output");
+    }
+    expect(() => defaultRuntime.exit(1)).toThrow(ExitError);
+    if (json) {
+      expect(JSON.parse(stdout.join(""))).toEqual({ ok: false });
+      expect(stderr.join("")).toContain("\x1b[?25h");
+    } else {
+      expect(stdout.join("")).toContain("operator-visible output\n");
+      expect(stdout.join("")).toContain("\x1b[?25h");
+      expect(stderr).toEqual([]);
+    }
+  });
 
-    expect(runtime.log).toHaveBeenCalledWith("plain output");
+  it("honors an explicitly selected reset stream in machine-output mode", () => {
+    const resetWrite = vi.fn(() => true);
+    const resetStream = { isTTY: true, write: resetWrite } as unknown as NodeJS.WriteStream;
+    loggingState.forceConsoleToStderr = true;
+
+    expect(() => defaultRuntime.exit(1, { resetStream })).toThrow(ExitError);
+
+    expect(resetWrite).toHaveBeenCalledWith(expect.stringContaining("\x1b[?25h"));
+    expect([stdout, stderr]).toEqual([[], []]);
   });
 });

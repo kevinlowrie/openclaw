@@ -1,19 +1,21 @@
 // Doctor auth hint tests cover OAuth refresh failure formatting and auth repair guidance.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { resolveSharedMainAuthAgentDir } from "../agents/auth-profiles/shared-main-dir.js";
+import { writePersistedAuthProfileStoreRaw } from "../agents/auth-profiles/sqlite.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { writeConfigMachineState } from "../state/config-machine-state-write.js";
 import {
   collectAuthProfileHealthFindings,
-  noteLegacyCodexProviderOverride,
+  collectCopilotAmbientTokenFindings,
+  collectLegacyCodexProviderOverrideFindings,
+  collectSharedAuthStoreFindings,
 } from "./doctor-auth.js";
-import { legacyCodexProviderOverrideToHealthFinding } from "./doctor-auth.test-support.js";
+
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 const mocks = vi.hoisted(() => ({
   ensureAuthProfileStore: vi.fn(),
-  note: vi.fn(),
-}));
-
-vi.mock("../../packages/terminal-core/src/note.js", () => ({
-  note: mocks.note,
 }));
 
 vi.mock("../agents/auth-profiles.js", async () => {
@@ -33,11 +35,75 @@ function doctorFixtureConfig(config: unknown): OpenClawConfig {
 describe("doctor auth hints", () => {
   beforeEach(() => {
     mocks.ensureAuthProfileStore.mockReset().mockReturnValue({ version: 1, profiles: {} });
-    mocks.note.mockClear();
+  });
+
+  it("reports ambient GITHUB_TOKEN activation only once", () => {
+    const { key, cfg } = {
+      key: "GITHUB_TOKEN",
+      cfg: { plugins: { entries: { "github-copilot": { enabled: true } } } },
+    } as const;
+
+    const env = {
+      OPENCLAW_STATE_DIR: tempDirs.make("openclaw-doctor-copilot-"),
+      [key]: "github-test-token",
+    };
+    expect(collectCopilotAmbientTokenFindings(cfg, env)).toEqual([
+      expect.objectContaining({
+        category: "recommended",
+        message: "GitHub Copilot is no longer enabled by GH_TOKEN/GITHUB_TOKEN.",
+        fixHint: expect.stringContaining("No action needed if you do not use Copilot"),
+      }),
+    ]);
+    expect(collectCopilotAmbientTokenFindings(cfg, env)).toEqual([]);
+  });
+
+  it.each([
+    { models: { providers: { "github-copilot": {} } } },
+    { auth: { profiles: { work: { provider: "github-copilot", mode: "token" } } } },
+  ])("does not consume the notice for explicit Copilot auth", (config) => {
+    const env = { OPENCLAW_STATE_DIR: tempDirs.make("openclaw-doctor-copilot-") };
+    expect(
+      collectCopilotAmbientTokenFindings(doctorFixtureConfig(config), {
+        ...env,
+        GH_TOKEN: "github-test-token",
+      }),
+    ).toEqual([]);
+    expect(
+      collectCopilotAmbientTokenFindings(
+        {},
+        {
+          ...env,
+          GH_TOKEN: "github-test-token",
+          COPILOT_GITHUB_TOKEN: "copilot-test-token",
+        },
+      ),
+    ).toEqual([]);
+    expect(
+      collectCopilotAmbientTokenFindings({}, { ...env, GH_TOKEN: "github-test-token" }),
+    ).toHaveLength(1);
+  });
+
+  it("suppresses the notice for a stored shared Copilot profile", () => {
+    const env = {
+      OPENCLAW_STATE_DIR: tempDirs.make("openclaw-doctor-copilot-"),
+      GH_TOKEN: "github-test-token",
+    };
+    const cfg: OpenClawConfig = { agents: { entries: { worker: {} } } };
+    const agentDir = resolveSharedMainAuthAgentDir(env);
+    writePersistedAuthProfileStoreRaw(
+      {
+        version: 1,
+        profiles: {
+          work: { type: "token", provider: "github-copilot", token: "copilot-test-token" },
+        },
+      },
+      agentDir,
+    );
+    expect(collectCopilotAmbientTokenFindings(cfg, env)).toEqual([]);
   });
 
   it("warns when a legacy Codex override shadows canonical OpenAI OAuth config", () => {
-    noteLegacyCodexProviderOverride(
+    const findings = collectLegacyCodexProviderOverrideFindings(
       doctorFixtureConfig({
         auth: {
           profiles: {
@@ -58,26 +124,42 @@ describe("doctor auth hints", () => {
       }),
     );
 
-    expect(mocks.note).toHaveBeenCalledWith(
-      expect.stringContaining("models.providers.openai-codex"),
-      "Codex OAuth",
-    );
+    expect(findings).toEqual([
+      expect.objectContaining({
+        category: "fix-now",
+        path: "models.providers.openai-codex",
+        fixHint: expect.stringContaining("Remove or rewrite"),
+      }),
+    ]);
   });
 
-  it("maps legacy Codex overrides to structured auth profile findings", () => {
-    expect(
-      legacyCodexProviderOverrideToHealthFinding({
-        api: "openai-responses",
-        baseUrl: "https://api.openai.com/v1",
+  it("reports the legacy shared auth owner with stored credentials", () => {
+    const env = {
+      ...process.env,
+      OPENCLAW_STATE_DIR: tempDirs.make("openclaw-doctor-shared-auth-"),
+    };
+    writePersistedAuthProfileStoreRaw(
+      {
+        version: 1,
+        profiles: {
+          "openai:default": { type: "api_key", provider: "openai", key: "test-key" },
+        },
+      },
+      resolveSharedMainAuthAgentDir(env),
+    );
+    expect(collectSharedAuthStoreFindings(env)).toEqual([
+      expect.objectContaining({
+        category: "recommended",
+        fixHint: expect.stringContaining("openclaw doctor --fix"),
       }),
-    ).toMatchObject({
-      checkId: "core/doctor/auth-profiles",
-      severity: "warning",
-      message:
-        "Legacy openai-codex transport override can shadow configured Codex OAuth credentials.",
-      path: "models.providers.openai-codex",
-      target: "openai-codex",
-    });
+    ]);
+
+    const relocatedEnv = {
+      ...process.env,
+      OPENCLAW_STATE_DIR: tempDirs.make("openclaw-doctor-relocated-auth-"),
+    };
+    writeConfigMachineState("auth.sharedStore", { location: "state-db" }, { env: relocatedEnv });
+    expect(collectSharedAuthStoreFindings(relocatedEnv)).toEqual([]);
   });
 
   it("collects legacy Codex override structured findings", async () => {
@@ -104,6 +186,9 @@ describe("doctor auth hints", () => {
     expect(findings).toEqual([
       expect.objectContaining({
         checkId: "core/doctor/auth-profiles",
+        severity: "warning",
+        message:
+          "Legacy openai-codex transport override can shadow configured Codex OAuth credentials.",
         path: "models.providers.openai-codex",
         target: "openai-codex",
       }),
@@ -124,7 +209,7 @@ describe("doctor auth hints", () => {
       },
     });
 
-    noteLegacyCodexProviderOverride(
+    const findings = collectLegacyCodexProviderOverrideFindings(
       doctorFixtureConfig({
         models: {
           providers: {
@@ -136,9 +221,11 @@ describe("doctor auth hints", () => {
       }),
     );
 
-    expect(mocks.note).toHaveBeenCalledWith(
-      expect.stringContaining("legacy transport override"),
-      "Codex OAuth",
-    );
+    expect(findings).toEqual([
+      expect.objectContaining({
+        category: "fix-now",
+        fixHint: expect.stringContaining("legacy transport override"),
+      }),
+    ]);
   });
 });

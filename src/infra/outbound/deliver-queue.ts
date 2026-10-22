@@ -1,67 +1,267 @@
-import { hasTrustedMessageAuditListeners } from "../../audit/message-audit-events.js";
-// Owns durable queue admission, custody, cleanup, and delivery completion.
+import { collectNestedErrorCandidates } from "@openclaw/normalization-core/error-coercion";
+// Owns durable queue admission and hands stable custody to the execution loop.
+import { readAskUserQuestionId } from "../../auto-reply/reply-payload.js";
+import { deriveDurableFinalDeliveryRequirementsForBatch } from "../../channels/message/capabilities.js";
+import { createRenderedMessageBatchPlan } from "../../channels/message/rendered-batch.js";
+import type { ChannelMessageDeferredDeliveryAdmissionResult } from "../../channels/message/types.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import {
-  findPlatformMessageRejectedError,
-  isProvenDeliveryNotSentError,
-} from "../delivery-recovery.shared.js";
+  captureDeliveryQueueStateContext,
+  type DeliveryQueueStateContext,
+} from "../delivery-queue-sqlite.js";
+import { isDeliveryRecoveryOwnedRetry } from "../delivery-recovery.shared.js";
 import { formatErrorMessage } from "../errors.js";
-import { resolveDeferredDeliveryAdmission } from "./deferred-delivery-admission.js";
-import type { DeliverOutboundPayloadsParams, PlatformSendRoute } from "./deliver-contracts.js";
-import { deliverOutboundPayloadsCore } from "./deliver-core.js";
+import { runWithQuestionChannelDeliveries } from "../question-channel-runtime.js";
+import { throwIfAborted } from "./abort.js";
+import { resolveOutboundChannelMessageAdapter } from "./channel-resolution.js";
+import { prepareDeferredDeliveryAdmission } from "./deferred-delivery-admission.js";
+import { resolveOutboundDurableFinalDeliverySupport } from "./deliver-channel.js";
+import type {
+  DeliverOutboundPayloadsParams,
+  InternalDeliverOutboundPayloadsParams,
+} from "./deliver-contracts.js";
+import { OUTBOUND_DELIVERY_LOG_SCOPE } from "./deliver-log.js";
+import { buildPayloadSummary } from "./deliver-payload.js";
+import {
+  prepareOutboundPayloadBatch,
+  prepareStructuredOutboundPayloadBatch,
+} from "./deliver-prepare.js";
 import {
   restoreQueuedDeliveryCustody,
   stageAndEnqueueOutboundDelivery,
 } from "./deliver-queue-admission.js";
+import { deliverOutboundPayloadsWithQueueCleanup } from "./deliver-queue-execute.js";
+import { createQueuedDeliveryOwner } from "./deliver-queue-state.js";
+import type { OutboundDeliveryResult, OutboundPayloadDeliveryOutcome } from "./deliver-types.js";
+import { markDurableDeliveryQueued } from "./delivery-completion.js";
+import { startDeliveryProducerLease } from "./delivery-queue-lease.js";
 import {
-  createQueuedDeliveryOwner,
-  isDeliveryAbortError,
-  persistQueuedPostSendState,
-  persistQueuedPreSendState,
-  type QueuedPostSendState,
-  type QueuedPreSendState,
-} from "./deliver-queue-state.js";
+  claimReusableDeliveryPlatformSendAttempt,
+  renewDeliveryPlatformSendLease,
+} from "./delivery-queue-platform-lease.js";
 import {
-  OutboundDeliveryError,
-  type OutboundDeliveryResult,
-  type OutboundPayloadDeliveryOutcome,
-} from "./deliver-types.js";
-import { runOutboundDeliveryCommitHooks } from "./delivery-commit-hooks.js";
+  StableDeliveryPreparationLostError,
+  withStableDeliveryPreparation,
+  type StableDeliveryPreparationOwner,
+} from "./delivery-queue-preparation.js";
+import { isOrdinaryFinalText } from "./delivery-queue-recovery-policy.js";
+import { recoverLiveFinalDelivery, withActiveDeliveryClaim } from "./delivery-queue-recovery.js";
 import {
-  completeDurableDelivery,
-  rejectDurableDelivery,
-  suppressDurableDelivery,
-} from "./delivery-completion.js";
-import { loadPendingDelivery } from "./delivery-queue-storage.js";
+  findDeliveryIntentOwner,
+  loadPendingDelivery,
+  reserveDeliveryAttempt,
+} from "./delivery-queue-storage.js";
+import { FINAL_TEXT_RECOVERY_MAX_ATTEMPTS } from "./delivery-queue-types.js";
+import { createMessageSentEmitter } from "./message-sent-hook.js";
 import {
-  claimDeliveryPlatformSendAttempt,
-  failDelivery,
-  failDeliveryAfterPlatformSend,
-  failDeliveryBeforePlatformSend,
-  markDeliveryPlatformSendDispatched,
-  withActiveDeliveryClaim,
-} from "./delivery-queue.js";
-import {
-  completedOutboundAuditTerminals,
+  emitOutboundAuditLifecycle,
   emitOutboundAuditTerminals,
-  failedOutboundAuditTerminals,
   uniformOutboundAuditTerminals,
 } from "./outbound-audit.js";
-import type { NormalizedOutboundPayload } from "./payloads.js";
+import { preparedOutboundPayloads } from "./prepared-batch.js";
+import type { OutboundPayloadPlan } from "./reply-payload-parts.js";
+import { normalizeOutboundReplyFacts } from "./reply-policy.js";
 
 const log = createSubsystemLogger("outbound/deliver");
+
+function isReusablePreparedDeliveryOwner(
+  owner: Awaited<ReturnType<typeof findDeliveryIntentOwner>>,
+): boolean {
+  // Pending recovery or a retained completion receipt already owns the effect.
+  // A replaying producer accepts that custody instead of creating another send.
+  return (
+    owner?.namespace === "prepared" && (owner.status === "pending" || owner.status === "completed")
+  );
+}
 
 export async function runOutboundDelivery(
   params: DeliverOutboundPayloadsParams,
 ): Promise<OutboundDeliveryResult[]> {
-  return await runOutboundDeliveryInternal(params);
+  return await runOutboundDeliveryInternal({
+    ...params,
+    conversationDeliveryTarget: undefined,
+    sessionGeneration: undefined,
+    deliveryQueueStateContext: undefined,
+  });
 }
 
 export async function runOutboundDeliveryInternal(
-  params: DeliverOutboundPayloadsParams,
+  initialInput: InternalDeliverOutboundPayloadsParams,
+  stateContext?: DeliveryQueueStateContext,
+  admittedReasoning?: true,
+): Promise<OutboundDeliveryResult[]> {
+  return await runDelivery(
+    initialInput,
+    (delivery, options) => prepareOutboundPayloadBatch(delivery, { ...options, admittedReasoning }),
+    stateContext,
+  );
+}
+
+export async function runStructuredOutboundDeliveryInternal(
+  input: Omit<InternalDeliverOutboundPayloadsParams, "payloads"> & {
+    plan: readonly OutboundPayloadPlan[];
+  },
+): Promise<OutboundDeliveryResult[]> {
+  const { plan, ...params } = input;
+  // This batch owns the supplied entries; queue outcome indexes refer to this
+  // batch rather than the earlier producer array from which entries were selected.
+  const batchPlan = plan.map((entry, sourceIndex) => Object.assign({}, entry, { sourceIndex }));
+  return await runDelivery(
+    { ...params, payloads: batchPlan.map((entry) => entry.payload) },
+    (delivery, options) => prepareStructuredOutboundPayloadBatch(delivery, batchPlan, options),
+  );
+}
+
+async function runDelivery(
+  initialInput: InternalDeliverOutboundPayloadsParams,
+  prepare: typeof prepareOutboundPayloadBatch,
+  stateContext?: DeliveryQueueStateContext,
+): Promise<OutboundDeliveryResult[]> {
+  const context =
+    initialInput.conversationDeliveryTarget ??
+    stateContext ??
+    captureDeliveryQueueStateContext(
+      initialInput.deliveryQueueId ? initialInput.deliveryQueueStateDir : undefined,
+    );
+  const input = {
+    ...initialInput,
+    deliveryQueueStateContext: context,
+    deliveryQueueStateDir: context.stateDir,
+  };
+  const owner =
+    input.deliveryQueueOwner ??
+    (input.deliveryQueueId
+      ? createQueuedDeliveryOwner(
+          {
+            queueId: input.deliveryQueueId,
+            stateDir: input.deliveryQueueStateDir,
+            expectedPlatformSendAttemptId: input.deliveryProducerClaimId,
+          },
+          input.deliveryQueueStateContext,
+        )
+      : undefined);
+  try {
+    return await runWithQuestionChannelDeliveries(input.payloads.map(readAskUserQuestionId), () =>
+      runOutboundDeliveryWithIntent({ ...input, deliveryQueueOwner: owner }, prepare),
+    );
+  } catch (error) {
+    throw owner ? owner.project(error) : error;
+  }
+}
+
+async function runOutboundDeliveryWithIntent(
+  input: InternalDeliverOutboundPayloadsParams,
+  prepare: typeof prepareOutboundPayloadBatch,
+): Promise<OutboundDeliveryResult[]> {
+  const { replyToId, replyToMode, ...currentParams } = input;
+  const reply = normalizeOutboundReplyFacts({ reply: input.reply, replyToId, replyToMode });
+  const params = { ...currentParams, ...(reply ? { reply } : {}) };
+  const stableIntentId = params.deliveryIntentId?.trim();
+  if (stableIntentId) {
+    params.deliveryIntentId = stableIntentId;
+    // Serializing preparation prevents concurrent producers from running
+    // stateful modifiers before SQLite chooses the stable delivery owner.
+    const claim = await withActiveDeliveryClaim(stableIntentId, async () => {
+      const preparation = await withStableDeliveryPreparation(
+        {
+          id: stableIntentId,
+          stateDir: params.deliveryQueueStateDir,
+          run: async (owner) => await runOutboundDeliveryWithQueue(params, prepare, true, owner),
+        },
+        params.deliveryQueueStateContext,
+      );
+      return preparation.status === "claimed"
+        ? preparation.value
+        : await runOutboundDeliveryWithQueue(params, prepare, true);
+    });
+    if (claim.status === "claimed") {
+      return claim.value;
+    }
+    const owner = params.reusePendingDeliveryIntent
+      ? await findDeliveryIntentOwner(
+          stableIntentId,
+          params.deliveryQueueStateDir,
+          params.deliveryQueueStateContext,
+        )
+      : null;
+    throwIfAborted(params.abortSignal);
+    if (isReusablePreparedDeliveryOwner(owner)) {
+      return [];
+    }
+    throw new Error(`Stable delivery intent is already queued: ${stableIntentId}`);
+  }
+  return await runOutboundDeliveryWithQueue(params, prepare, false);
+}
+
+async function deliverWithProducerLease(
+  params: InternalDeliverOutboundPayloadsParams,
+  queueId: string | null,
+  auditStartedAt: number,
+  producerClaimId: string | undefined,
+  questionBinding: "captured" | "unbound",
+): Promise<OutboundDeliveryResult[]> {
+  return await runWithQuestionChannelDeliveries(
+    params.payloads.map(readAskUserQuestionId),
+    async () => {
+      if (params.deliveryProducerLeaseRequired !== true) {
+        return await deliverOutboundPayloadsWithQueueCleanup(
+          params,
+          queueId,
+          auditStartedAt,
+          producerClaimId,
+        );
+      }
+      const platformQueueId = queueId ?? params.deliveryQueueId;
+      if (!platformQueueId || !producerClaimId) {
+        throw new Error("Delivery producer lease requires an exact queue owner");
+      }
+      const stateDir = params.deliveryQueueStateDir;
+      const lease = await startDeliveryProducerLease({
+        id: platformQueueId,
+        renew: async () =>
+          await renewDeliveryPlatformSendLease(
+            platformQueueId,
+            stateDir,
+            producerClaimId,
+            params.deliveryQueueStateContext,
+          ),
+      });
+      if (params.deliveryQueueOwner) {
+        params.deliveryQueueOwner.signal = lease.signal;
+      }
+      const abortSignal = params.abortSignal
+        ? AbortSignal.any([params.abortSignal, lease.signal])
+        : lease.signal;
+      try {
+        return await deliverOutboundPayloadsWithQueueCleanup(
+          { ...params, abortSignal },
+          queueId,
+          auditStartedAt,
+          producerClaimId,
+          lease,
+        );
+      } finally {
+        await lease.stop();
+      }
+    },
+    { unbound: questionBinding === "unbound" },
+  );
+}
+
+async function runOutboundDeliveryWithQueue(
+  params: InternalDeliverOutboundPayloadsParams,
+  prepare: typeof prepareOutboundPayloadBatch,
+  stableIntentClaimHeld: boolean,
+  stablePreparationOwner?: StableDeliveryPreparationOwner,
 ): Promise<OutboundDeliveryResult[]> {
   const auditStartedAt = Date.now();
   const { channel, to, payloads } = params;
+  const assertDeliveryCurrent = (): void => {
+    throwIfAborted(params.abortSignal);
+    params.deliveryQueueOwner?.signal?.throwIfAborted();
+    params.deliveryQueueStateContext?.workerContext.admission.assertCurrent();
+  };
   const emitPreQueueFailure = (): void => {
     // Recovery owns the stable queue terminal for replayed intents.
     if (params.deliveryQueueId !== undefined) {
@@ -77,6 +277,33 @@ export async function runOutboundDeliveryInternal(
       startedAt: auditStartedAt,
     });
   };
+  const emitPreparationFailure = (error: unknown): void => {
+    emitPreQueueFailure();
+    // Preparation aborts the whole batch, so hooks get one failure per
+    // logical payload — matching the per-payload audit terminals above and
+    // the recovery sibling's queuedTerminalFailureEvents.
+    if (params.payloads.length > 0) {
+      const { emitMessageSent } = createMessageSentEmitter({
+        hookRunner: getGlobalHookRunner(),
+        channel,
+        to,
+        accountId: params.accountId,
+        sessionKeyForInternalHooks: params.mirror?.sessionKey ?? params.session?.key,
+        isGroup: params.mirror?.isGroup,
+        groupId: params.mirror?.groupId,
+        runId: params.replyPayloadSendingHook?.runId,
+        logPrefix: OUTBOUND_DELIVERY_LOG_SCOPE,
+      });
+      for (const payload of params.payloads) {
+        const summary = buildPayloadSummary(payload);
+        emitMessageSent({
+          success: false,
+          content: summary.hookContent ?? summary.text,
+          error: formatErrorMessage(error),
+        });
+      }
+    }
+  };
   if (params.requireUnknownSendReconciliation === true && payloads.length !== 1) {
     emitPreQueueFailure();
     throw new Error(
@@ -84,580 +311,387 @@ export async function runOutboundDeliveryInternal(
     );
   }
   if (params.deferredDeliveryAdmissionPassed !== true) {
-    const admission = resolveDeferredDeliveryAdmission({
-      cfg: params.cfg,
-      channel,
-      to,
-      accountId: params.accountId,
-      phase: "live",
-    });
+    let admission: ChannelMessageDeferredDeliveryAdmissionResult;
+    try {
+      const resolveAdmission = await prepareDeferredDeliveryAdmission(
+        {
+          cfg: params.cfg,
+          channel,
+          to,
+          accountId: params.accountId,
+          phase: "live",
+        },
+        {
+          agentId: params.session?.agentId,
+          assertCurrent: assertDeliveryCurrent,
+        },
+      );
+      admission = resolveAdmission();
+    } catch (error) {
+      emitPreparationFailure(error);
+      throw error;
+    }
     if (admission.status === "permanent_rejection") {
       emitPreQueueFailure();
       throw new Error(admission.reason);
     }
   }
   const queuePolicy = params.queuePolicy ?? "best_effort";
+  const existingStableDelivery = params.deliveryIntentId
+    ? await loadPendingDelivery(
+        params.deliveryIntentId,
+        params.deliveryQueueStateDir,
+        params.deliveryQueueStateContext,
+      )
+    : null;
+  if (params.deliveryIntentId && !existingStableDelivery && !stablePreparationOwner) {
+    const owner = await findDeliveryIntentOwner(
+      params.deliveryIntentId,
+      params.deliveryQueueStateDir,
+      params.deliveryQueueStateContext,
+    );
+    assertDeliveryCurrent();
+    if (owner) {
+      if (params.reusePendingDeliveryIntent && isReusablePreparedDeliveryOwner(owner)) {
+        return [];
+      }
+      throw new Error(
+        owner.namespace === "legacy"
+          ? `Stable delivery intent is awaiting queue migration: ${params.deliveryIntentId}`
+          : `Stable delivery intent is already queued: ${params.deliveryIntentId}`,
+      );
+    }
+    if (stableIntentClaimHeld) {
+      throw new Error(`Stable delivery intent is already queued: ${params.deliveryIntentId}`);
+    }
+  }
+  if (existingStableDelivery && !params.reusePendingDeliveryIntent) {
+    throw new Error(`Stable delivery intent is already queued: ${params.deliveryIntentId}`);
+  }
+  let preparedBatch;
+  try {
+    // Modifying policy is intentionally a pre-admission boundary. Persisting
+    // raw content before it is cancelled or redacted would recreate the leak
+    // this queue contract removes; queue durability begins at prepared custody.
+    preparedBatch =
+      existingStableDelivery?.preparedBatch ??
+      params.preparedBatch ??
+      (await prepare(params, {
+        onBeforeFirstModifier: stablePreparationOwner?.beforeFirstModifier,
+      }));
+    await stablePreparationOwner?.markPrepared();
+  } catch (error) {
+    emitPreparationFailure(error);
+    throw error;
+  }
+  const preparedPayloads = preparedOutboundPayloads(preparedBatch);
+  const preparedRenderedBatchPlan =
+    existingStableDelivery?.renderedBatchPlan ??
+    (params.preparedBatch ? params.renderedBatchPlan : undefined) ??
+    createRenderedMessageBatchPlan(preparedPayloads);
+  let unknownSendReconciliationEnabled = params.requireUnknownSendReconciliation === true;
+  if (params.requireUnknownSendReconciliation !== false && preparedPayloads.length === 1) {
+    const requirements = deriveDurableFinalDeliveryRequirementsForBatch({
+      payloads: preparedPayloads,
+      replyToId: params.reply?.replyToId,
+      threadId: params.threadId,
+      silent: params.silent,
+      reconcileUnknownSend: true,
+    });
+    delete requirements.messageSendingHooks;
+    const support = await resolveOutboundDurableFinalDeliverySupport({
+      cfg: params.cfg,
+      agentId: params.session?.agentId,
+      channel,
+      requirements,
+    });
+    if (params.requireUnknownSendReconciliation === true && !support.ok) {
+      emitPreQueueFailure();
+      throw new Error(
+        `Required durable message send is unsupported for ${channel}: prepared payload capability mismatch${support.capability ? ` (${support.capability})` : ""}`,
+      );
+    }
+    unknownSendReconciliationEnabled =
+      support.ok &&
+      (params.requireUnknownSendReconciliation === true ||
+        support.automaticUnknownSendReconciliation);
+  }
+  const isTextOnlyChannelData =
+    params.retryAmbiguousFinalText === true &&
+    preparedPayloads.length === 1 &&
+    preparedPayloads[0]?.channelData !== undefined
+      ? (
+          await resolveOutboundChannelMessageAdapter({
+            cfg: params.cfg,
+            agentId: params.session?.agentId,
+            channel,
+          })
+        )?.durableFinal?.isTextOnlyChannelData
+      : undefined;
+  const deliveryParams: InternalDeliverOutboundPayloadsParams = {
+    ...params,
+    payloads: preparedPayloads,
+    preparedBatch,
+    retryAmbiguousFinalText:
+      params.retryAmbiguousFinalText === true &&
+      isOrdinaryFinalText(preparedPayloads, isTextOnlyChannelData)
+        ? true
+        : undefined,
+    // Recovery must preserve the provider-facing plan captured before local
+    // media was rewritten to spool paths; reconciliation uses that same plan.
+    renderedBatchPlan: preparedRenderedBatchPlan,
+    ...(unknownSendReconciliationEnabled ? { requireUnknownSendReconciliation: true } : {}),
+  };
 
   // Invocation authority is not queued; recovery must re-enter delegated after restart.
   // Write-ahead delivery queue: persist before sending, remove after success.
-  const queued = params.skipQueue
-    ? null
-    : await stageAndEnqueueOutboundDelivery(params).catch((err: unknown) => {
-        if (queuePolicy === "required") {
-          emitPreQueueFailure();
-          throw err;
-        }
-        return null;
-      }); // Best-effort delivery falls back to direct send if staging or the queue write fails.
+  const shouldPersistSuppressedIntent = Boolean(
+    params.deliveryIntentId || params.deliveryCompletion || params.completionRetention,
+  );
+  const queued =
+    params.skipQueue || (preparedPayloads.length === 0 && !shouldPersistSuppressedIntent)
+      ? null
+      : await stageAndEnqueueOutboundDelivery(deliveryParams, preparedBatch, {
+          claimForLiveDelivery: true,
+          ...(stablePreparationOwner
+            ? { getStablePreparation: stablePreparationOwner.current }
+            : {}),
+        }).catch((err: unknown) => {
+          if (isDeliveryRecoveryOwnedRetry(err)) {
+            throw err;
+          }
+          if (
+            queuePolicy === "required" ||
+            collectNestedErrorCandidates(err).some(
+              (candidate) => candidate instanceof StableDeliveryPreparationLostError,
+            )
+          ) {
+            emitPreQueueFailure();
+            throw err;
+          }
+          // Best-effort delivery continues live-only, but a crash mid-send now
+          // loses the message — record why the write-ahead row is missing.
+          log.warn(
+            `outbound queue write failed; continuing without durability (channel=${params.channel} to=${params.to}): ${formatErrorMessage(err)}`,
+          );
+          return null;
+        });
 
   const queueId = queued?.id ?? null;
-  if (queueId) {
-    params.onDeliveryIntent?.({
-      id: queueId,
-      channel,
-      to,
-      ...(params.accountId ? { accountId: params.accountId } : {}),
-      queuePolicy,
-    });
-  }
-
-  if (!queueId) {
-    return await deliverOutboundPayloadsWithQueueCleanup(
-      params,
-      null,
-      auditStartedAt,
-      params.deliveryProducerClaimId,
-    );
-  }
-
-  if (!queued?.created && !params.reusePendingDeliveryIntent) {
-    throw new Error(`Stable delivery intent is already queued: ${queueId}`);
-  }
-  const claimResult = await withActiveDeliveryClaim(queueId, async () => {
-    const producerClaimId = params.reusePendingDeliveryIntent
-      ? await claimDeliveryPlatformSendAttempt(queueId)
-      : undefined;
-    if (params.reusePendingDeliveryIntent && !producerClaimId) {
-      throw new Error(`Stable delivery intent is already queued: ${queueId}`);
-    }
-    let deliveryParams = params;
-    if (queued?.created !== true) {
-      const queuedEntry = await loadPendingDelivery(queueId);
-      if (!queuedEntry || queuedEntry.producerClaimId !== producerClaimId) {
-        throw new Error(`Stable delivery platform claim was lost: ${queueId}`);
-      }
-      deliveryParams = restoreQueuedDeliveryCustody(params, queuedEntry);
-    }
-    return deliverOutboundPayloadsWithQueueCleanup(
-      deliveryParams,
-      queueId,
-      auditStartedAt,
-      producerClaimId,
-    );
-  });
-  if (claimResult.status === "claimed") {
-    return claimResult.value;
-  }
-  if (params.reusePendingDeliveryIntent) {
-    throw new Error(`Stable delivery intent is already queued: ${queueId}`);
-  }
-  return [];
-}
-
-async function deliverOutboundPayloadsWithQueueCleanup(
-  params: DeliverOutboundPayloadsParams,
-  queueId: string | null,
-  auditStartedAt: number,
-  producerClaimId?: string,
-): Promise<OutboundDeliveryResult[]> {
-  // Wrap onError to detect partial failures under bestEffort mode.
-  // When bestEffort is true, per-payload errors are caught and passed to onError
-  // without throwing — so the outer try/catch never fires. We track whether any
-  // payload failed so we can call failDelivery instead of ackDelivery.
-  let hadPartialFailure = false;
-  let lastPayloadError: unknown;
-  let partialFailuresAreProvenNotSent = true;
-  const ownsAuditTerminal = params.deliveryQueueId === undefined;
-  const auditPayloadOutcomes =
-    ownsAuditTerminal && hasTrustedMessageAuditListeners()
-      ? ([] as OutboundPayloadDeliveryOutcome[])
-      : undefined;
-  // Recipient custody must observe ambiguous adapter outcomes even when no
-  // audit listener is installed; audit subscriptions are not delivery proof.
-  const stablePayloadOutcomes = producerClaimId
-    ? ([] as OutboundPayloadDeliveryOutcome[])
-    : undefined;
-  const queuePolicy = params.queuePolicy ?? "best_effort";
-  const platformQueueId = queueId ?? params.deliveryQueueId;
-  const platformQueuePolicy = queueId ? queuePolicy : (params.queuePolicy ?? "required");
-  const platformQueueStateDir = queueId ? undefined : params.deliveryQueueStateDir;
-  const exactReconciliationRequired =
-    params.requireUnknownSendReconciliation === true && platformQueueId !== undefined;
-  let queuedPreSendState: QueuedPreSendState | undefined;
-  let queuedPostSendState: QueuedPostSendState | undefined;
-  let platformSendRoute: PlatformSendRoute | undefined;
-  let deliveredResults: OutboundDeliveryResult[] = [];
-  let commitHooksRun = false;
   const queueOwner = queueId
-    ? createQueuedDeliveryOwner({
-        queueId,
-        expectedPlatformSendAttemptId: () => producerClaimId,
-      })
-    : undefined;
-  const ackOwnedQueue = (options?: { suppressCompletionReceipt?: boolean }) => {
-    if (!queueOwner) {
-      throw new Error("Queued delivery acknowledgement requires a queue id");
-    }
-    return queueOwner.ack(options);
-  };
-  const recordOwnedQueueFailure = (
-    record: typeof failDelivery | typeof failDeliveryAfterPlatformSend,
-    error: string,
-  ) => {
-    if (!queueOwner) {
-      throw new Error("Queued delivery failure requires a queue id");
-    }
-    return queueOwner.fail(record, error);
-  };
-  const persistOwnedPostSendState = () => {
-    if (!queueId) {
-      throw new Error("Queued delivery post-send state requires a queue id");
-    }
-    return persistQueuedPostSendState({
-      queueId,
-      queuePolicy,
-      ...(producerClaimId ? { producerClaimId } : {}),
-    });
-  };
-  const emitTerminals = (
-    terminals: Parameters<typeof emitOutboundAuditTerminals>[0]["terminals"],
-  ): void => {
-    if (!ownsAuditTerminal) {
-      return;
-    }
-    emitOutboundAuditTerminals({
-      context: params,
-      terminals,
-      startedAt: auditStartedAt,
-      ...(queueId ? { queueId } : {}),
-    });
-  };
-  const runCommitHooksAfterAck = async (): Promise<void> => {
-    if (
-      queuedPostSendState !== "acked" ||
-      params.deferCommitHooks ||
-      commitHooksRun ||
-      deliveredResults.length === 0
-    ) {
-      return;
-    }
-    commitHooksRun = true;
-    await runOutboundDeliveryCommitHooks(deliveredResults);
-  };
-  const wrappedParams: DeliverOutboundPayloadsParams = {
-    ...params,
-    // A provider marker can represent the whole durable intent only when one payload owns it.
-    // Adapters must narrow further when one payload can fan out into multiple platform sends.
-    ...(exactReconciliationRequired && params.payloads.length === 1
-      ? { deliveryQueueId: platformQueueId }
-      : { deliveryQueueId: undefined }),
-    requiredUnknownSendReconciliation: exactReconciliationRequired,
-    onPlatformSendStart: async (route) => {
-      platformSendRoute = route;
-      if (platformQueueId && !exactReconciliationRequired && queuedPreSendState === undefined) {
-        queuedPreSendState = await persistQueuedPreSendState({
-          queueId: platformQueueId,
-          queuePolicy: platformQueuePolicy,
-          stateDir: platformQueueStateDir,
-          route,
-          producerClaimId,
-          // Recovery sends read queue-owned media. Removing the row prevents a
-          // duplicate replay, but the active adapter still needs the files.
-          retainSpoolArtifacts: queueId === null && params.deliveryQueueId !== undefined,
-        });
-        if (queueId && queuedPreSendState === "acked") {
-          queuedPostSendState = "acked";
-        }
-      }
-      await params.onPlatformSendStart?.(route);
-    },
-    onPlatformSendDispatch: async () => {
-      if (platformQueueId && queuedPreSendState !== "acked") {
-        try {
-          if (producerClaimId) {
-            await markDeliveryPlatformSendDispatched(
-              platformQueueId,
-              platformQueueStateDir,
-              platformSendRoute,
-              producerClaimId,
-            );
-          } else {
-            await markDeliveryPlatformSendDispatched(
-              platformQueueId,
-              platformQueueStateDir,
-              platformSendRoute,
-            );
-          }
-          queuedPreSendState ??= "marked";
-        } catch (dispatchMarkError) {
-          if (exactReconciliationRequired || producerClaimId) {
-            throw dispatchMarkError;
-          }
-          log.warn(
-            `failed to refresh queued delivery ${platformQueueId} at platform dispatch; continuing best-effort send: ${formatErrorMessage(dispatchMarkError)}`,
-          );
-        }
-      }
-      await params.onPlatformSendDispatch?.();
-    },
-    onError: (err: unknown, payload: NormalizedOutboundPayload) => {
-      hadPartialFailure = true;
-      lastPayloadError = err;
-      partialFailuresAreProvenNotSent &&= isProvenDeliveryNotSentError(err);
-      params.onError?.(err, payload);
-    },
-    ...(auditPayloadOutcomes || stablePayloadOutcomes
-      ? {
-          onPayloadDeliveryOutcome: (outcome: OutboundPayloadDeliveryOutcome) => {
-            auditPayloadOutcomes?.push(outcome);
-            stablePayloadOutcomes?.push(outcome);
-            params.onPayloadDeliveryOutcome?.(outcome);
-          },
-        }
-      : {}),
-    onDeliveryResult: async (result) => {
-      deliveredResults.push(result);
-      if (queueId && queuedPostSendState === undefined) {
-        queuedPostSendState = await persistOwnedPostSendState();
-      }
-      await params.onDeliveryResult?.(result);
-    },
-  };
-  let platformResultsReturned = false;
-
-  try {
-    const results = await deliverOutboundPayloadsCore(wrappedParams);
-    // Core reconciles adapter progress objects with hook-bearing final results.
-    deliveredResults = results;
-    platformResultsReturned = true;
-    if (
-      queueId &&
-      results.length > 0 &&
-      stablePayloadOutcomes?.some(
-        (outcome) =>
-          outcome.status === "suppressed" && outcome.reason === "adapter_returned_no_identity",
+    ? createQueuedDeliveryOwner(
+        {
+          queueId,
+          stateDir: params.deliveryQueueStateDir,
+          expectedPlatformSendAttemptId: queued?.producerClaimId,
+        },
+        params.deliveryQueueStateContext,
       )
-    ) {
-      const error = "platform send returned no delivery identity for part of the delivery batch";
-      await recordOwnedQueueFailure(failDeliveryAfterPlatformSend, error);
-      queuedPostSendState = "failed";
-      throw new OutboundDeliveryError(error, {
-        cause: new Error(error),
-        results,
-        payloadOutcomes: stablePayloadOutcomes,
-        stage: "platform_send",
+    : params.deliveryQueueOwner;
+  deliveryParams.deliveryQueueOwner = queueOwner;
+  let recoveredFailure: Error | undefined;
+  try {
+    if (queued?.created && stablePreparationOwner) {
+      stablePreparationOwner.markPublished();
+    }
+    if (queueId && queueOwner && params.deliveryCompletion) {
+      const completion = await markDurableDeliveryQueued(
+        params.deliveryCompletion,
+        queueId,
+        queued?.created ? "prepared" : undefined,
+        params.deliveryQueueStateDir,
+        params.deliveryQueueStateContext,
+        params.conversationDeliveryTarget,
+      );
+      if (completion.state !== "queued") {
+        await queueOwner.ack({ suppressCompletionReceipt: true });
+        return [];
+      }
+    }
+    if (queueId) {
+      emitOutboundAuditLifecycle({
+        context: deliveryParams,
+        outcome: "queued",
+        queueId,
+        startedAt: auditStartedAt,
+      });
+      params.onDeliveryIntent?.({
+        id: queueId,
+        channel,
+        to,
+        ...(params.accountId ? { accountId: params.accountId } : {}),
+        queuePolicy,
       });
     }
+
     if (!queueId) {
-      if (params.deliveryCompletion) {
-        if (results.length > 0) {
-          completeDurableDelivery(params.deliveryCompletion, results.at(-1)!);
-        } else {
-          suppressDurableDelivery(params.deliveryCompletion);
-        }
-      }
-      if (!params.deferCommitHooks) {
-        await runOutboundDeliveryCommitHooks(results);
-      }
-      emitTerminals(() =>
-        hadPartialFailure
-          ? failedOutboundAuditTerminals({
-              payloadCount: params.payloads.length,
-              results,
-              payloadOutcomes: auditPayloadOutcomes ?? [],
-              failureStage: "platform_send",
-            })
-          : completedOutboundAuditTerminals({
-              payloadCount: params.payloads.length,
-              results,
-              payloadOutcomes: auditPayloadOutcomes ?? [],
-            }),
+      return await deliverWithProducerLease(
+        deliveryParams,
+        null,
+        auditStartedAt,
+        params.deliveryProducerClaimId,
+        existingStableDelivery || params.deliveryQueueId !== undefined ? "unbound" : "captured",
       );
-      return results;
     }
-    if (queueId) {
-      if (hadPartialFailure) {
-        const partialSendEvidence =
-          results.length > 0 ||
-          (lastPayloadError instanceof OutboundDeliveryError && lastPayloadError.sentBeforeError);
-        const postSendState =
-          queuedPostSendState ??
-          (partialSendEvidence ? await persistOwnedPostSendState() : undefined);
-        const error = "partial delivery failure (bestEffort)";
-        if (postSendState === undefined || postSendState === "marked") {
-          const recordFailure =
-            !partialSendEvidence && partialFailuresAreProvenNotSent
-              ? failDeliveryBeforePlatformSend
-              : failDelivery;
-          await recordOwnedQueueFailure(recordFailure, error).catch((err: unknown) => {
-            log.warn(
-              `failed to mark queued delivery ${queueId} as failed after partial failure; continuing best-effort delivery: ${formatErrorMessage(err)}`,
-            );
-          });
-        } else if (postSendState === "acked") {
-          // Direct ack is the fallback when the post-send marker cannot be
-          // written. Once the row is gone, recovery cannot run these hooks.
-          await runCommitHooksAfterAck();
-          emitTerminals(() =>
-            failedOutboundAuditTerminals({
-              payloadCount: params.payloads.length,
-              results,
-              payloadOutcomes: auditPayloadOutcomes ?? [],
-              failureStage: "platform_send",
-            }),
-          );
-        }
-      } else {
-        if (params.deliveryCompletion) {
-          if (results.length > 0) {
-            completeDurableDelivery(params.deliveryCompletion, results.at(-1)!);
-          } else {
-            suppressDurableDelivery(params.deliveryCompletion);
-          }
-        }
-        const postSendState =
-          queuedPostSendState ??
-          (results.length > 0 || queuedPreSendState === "marked"
-            ? await persistOwnedPostSendState()
-            : queuedPreSendState === "acked"
-              ? "acked"
-              : undefined);
-        if (results.length === 0 && postSendState === "marked") {
-          // The provider was invoked but returned no recipient-visible identity;
-          // never convert that ambiguous platform outcome into a success receipt.
-          await recordOwnedQueueFailure(
-            failDeliveryAfterPlatformSend,
-            "platform send returned no delivery identity",
-          );
-          queuedPostSendState = "failed";
-          emitTerminals(() =>
-            uniformOutboundAuditTerminals(params.payloads.length, {
-              outcome: "unknown",
-              failureStage: "platform_send",
-            }),
-          );
-          return results;
-        }
-        const acked =
-          postSendState === "acked"
-            ? true
-            : postSendState === "failed"
-              ? false
-              : await (
-                  results.length === 0 && typeof params.completionRetention === "object"
-                    ? ackOwnedQueue({ suppressCompletionReceipt: true })
-                    : ackOwnedQueue()
-                )
-                  .then(() => true)
-                  .catch(async (err: unknown) => {
-                    const hasSendEvidence =
-                      deliveredResults.length > 0 || queuedPreSendState !== undefined;
-                    try {
-                      if (hasSendEvidence) {
-                        await recordOwnedQueueFailure(
-                          failDeliveryAfterPlatformSend,
-                          `failed to ack sent delivery: ${formatErrorMessage(err)}`,
-                        );
-                        queuedPostSendState = "failed";
-                      } else {
-                        await recordOwnedQueueFailure(
-                          failDelivery,
-                          `failed to ack unsent delivery: ${formatErrorMessage(err)}`,
-                        );
-                      }
-                    } catch (persistErr: unknown) {
-                      log.warn(
-                        `failed to preserve queued delivery ${queueId} after ack failure: ${formatErrorMessage(persistErr)}`,
-                      );
-                    }
-                    if (queuePolicy === "required") {
-                      throw err;
-                    }
-                    log.warn(
-                      hasSendEvidence
-                        ? `failed to ack queued delivery ${queueId}; preserved unknown-after-send state: ${formatErrorMessage(err)}`
-                        : `failed to ack unsent queued delivery ${queueId}; retained it for retry: ${formatErrorMessage(err)}`,
-                    );
-                    return false;
-                  });
-        if (acked) {
-          queuedPostSendState = "acked";
-          await runCommitHooksAfterAck();
-          emitTerminals(() =>
-            completedOutboundAuditTerminals({
-              payloadCount: params.payloads.length,
-              results,
-              payloadOutcomes: auditPayloadOutcomes ?? [],
-            }),
-          );
-        }
+
+    if (!queued?.created && !params.reusePendingDeliveryIntent) {
+      throw new Error(`Stable delivery intent is already queued: ${queueId}`);
+    }
+    const deliverClaimedIntent = async (): Promise<OutboundDeliveryResult[]> => {
+      const producerClaimId =
+        queued?.producerClaimId ??
+        (params.reusePendingDeliveryIntent
+          ? await claimReusableDeliveryPlatformSendAttempt(
+              queueId,
+              params.deliveryQueueStateDir,
+              params.deliveryQueueStateContext,
+            )
+          : undefined);
+      if (!producerClaimId) {
+        throw new Error(
+          queued?.created
+            ? `Delivery platform claim was lost: ${queueId}`
+            : `Stable delivery intent is already queued: ${queueId}`,
+        );
       }
-    }
-    return results;
-  } catch (err) {
-    if (err instanceof OutboundDeliveryError && err.results.length > 0) {
-      deliveredResults = err.results;
-    }
-    if (queueId) {
-      if (isDeliveryAbortError(err)) {
-        const ambiguousStableAbort =
-          producerClaimId !== undefined &&
-          (deliveredResults.length > 0 ||
-            queuedPreSendState === "marked" ||
-            queuedPostSendState === "marked" ||
-            stablePayloadOutcomes?.some((outcome) => outcome.status === "sent"));
-        if (ambiguousStableAbort) {
-          if (queuedPostSendState !== "failed") {
-            await recordOwnedQueueFailure(
-              failDeliveryAfterPlatformSend,
-              `delivery aborted after platform send: ${formatErrorMessage(err)}`,
-            );
-            queuedPostSendState = "failed";
-          }
-          emitTerminals(() =>
-            uniformOutboundAuditTerminals(params.payloads.length, {
-              outcome: "unknown",
-              failureStage: "platform_send",
-            }),
-          );
-        } else if (
-          await (
-            producerClaimId ? ackOwnedQueue({ suppressCompletionReceipt: true }) : ackOwnedQueue()
-          )
-            .then(() => true)
-            .catch(() => false)
-        ) {
-          emitTerminals(() =>
-            failedOutboundAuditTerminals({
-              payloadCount: params.payloads.length,
-              results: deliveredResults,
-              payloadOutcomes: auditPayloadOutcomes ?? [],
-              failureStage: "queue",
-            }),
-          );
+      if (queueOwner) {
+        queueOwner.claimId = producerClaimId;
+      }
+      let claimedDeliveryParams = deliveryParams;
+      if (queued?.created !== true) {
+        const queuedEntry = await loadPendingDelivery(
+          queueId,
+          params.deliveryQueueStateDir,
+          params.deliveryQueueStateContext,
+        );
+        if (!queuedEntry || queuedEntry.producerClaimId !== producerClaimId) {
+          throw new Error(`Delivery platform claim was lost: ${queueId}`);
         }
-      } else if (!platformResultsReturned) {
-        const sendEvidence =
-          deliveredResults.length > 0 ||
-          (err instanceof OutboundDeliveryError && err.sentBeforeError);
-        if (sendEvidence) {
-          try {
-            queuedPostSendState ??= await persistOwnedPostSendState();
-            if (queuedPostSendState === "marked") {
-              await recordOwnedQueueFailure(failDeliveryAfterPlatformSend, formatErrorMessage(err));
-              queuedPostSendState = "failed";
-            }
-          } catch (persistErr: unknown) {
-            // Do not convert concrete send evidence back into a generic retry.
-            // All canonical state transitions failed, so retain the original row.
-            log.warn(
-              `failed to preserve queued delivery ${queueId} post-send evidence: ${formatErrorMessage(persistErr)}`,
-            );
-          }
-          await runCommitHooksAfterAck();
-          if (queuedPostSendState === "acked") {
-            emitTerminals(() =>
-              failedOutboundAuditTerminals({
-                payloadCount: params.payloads.length,
-                results: deliveredResults,
-                payloadOutcomes: auditPayloadOutcomes ?? [],
-                failureStage: err instanceof OutboundDeliveryError ? err.stage : "platform_send",
-              }),
-            );
-          }
-        } else if (queuedPreSendState === "acked") {
-          // The best-effort marker fallback removed the durable row before
-          // provider I/O, so this owner must emit the stable queue terminal.
-          emitTerminals(() =>
-            failedOutboundAuditTerminals({
-              payloadCount: params.payloads.length,
-              results: deliveredResults,
-              payloadOutcomes: auditPayloadOutcomes ?? [],
-              failureStage: err instanceof OutboundDeliveryError ? err.stage : "platform_send",
-            }),
-          );
-        } else {
-          const permanentRejection = findPlatformMessageRejectedError(err);
-          let terminalRejectionHandled = false;
-          if (permanentRejection) {
-            let ownerRejected = false;
-            let queueAcked = false;
-            try {
-              const ambiguousStableRejection =
-                producerClaimId !== undefined &&
-                (deliveredResults.length > 0 ||
-                  queuedPostSendState === "marked" ||
-                  stablePayloadOutcomes?.some((outcome) => outcome.status === "sent"));
-              if (ambiguousStableRejection) {
-                await recordOwnedQueueFailure(
-                  failDeliveryAfterPlatformSend,
-                  `delivery partially sent before permanent rejection: ${permanentRejection.message}`,
-                );
-                queuedPostSendState = "failed";
-                terminalRejectionHandled = true;
-              } else {
-                if (params.deliveryCompletion) {
-                  rejectDurableDelivery(params.deliveryCompletion, permanentRejection.message);
-                  ownerRejected = true;
-                }
-                await (producerClaimId
-                  ? ackOwnedQueue({ suppressCompletionReceipt: true })
-                  : ackOwnedQueue());
-                queueAcked = true;
-              }
-            } catch (rejectionError) {
-              log.warn(
-                `failed to finalize permanently rejected delivery ${queueId}: ${formatErrorMessage(rejectionError)}`,
-              );
-            }
-            terminalRejectionHandled ||= ownerRejected || queueAcked;
-            if (queueAcked) {
-              emitTerminals(() =>
-                failedOutboundAuditTerminals({
-                  payloadCount: params.payloads.length,
-                  results: deliveredResults,
-                  payloadOutcomes: auditPayloadOutcomes ?? [],
-                  failureStage: "platform_send",
-                }),
-              );
-            }
-          }
-          if (!terminalRejectionHandled) {
-            const recordFailure = isProvenDeliveryNotSentError(err)
-              ? failDeliveryBeforePlatformSend
-              : failDelivery;
-            await recordOwnedQueueFailure(recordFailure, formatErrorMessage(err)).catch(
-              (failErr: unknown) => {
-                log.warn(
-                  `failed to mark queued delivery ${queueId} as failed: ${formatErrorMessage(failErr)}`,
-                );
+        claimedDeliveryParams = restoreQueuedDeliveryCustody(deliveryParams, queuedEntry);
+      }
+      if (claimedDeliveryParams.retryAmbiguousFinalText !== true) {
+        return await deliverWithProducerLease(
+          { ...claimedDeliveryParams, deliveryProducerLeaseRequired: true },
+          queueId,
+          auditStartedAt,
+          producerClaimId,
+          queued?.created === true ? "captured" : "unbound",
+        );
+      }
+      const outcomes: OutboundPayloadDeliveryOutcome[] = [];
+      let finalError: Parameters<NonNullable<typeof claimedDeliveryParams.onError>> | undefined;
+      try {
+        const reservation = await reserveDeliveryAttempt(
+          queueId,
+          FINAL_TEXT_RECOVERY_MAX_ATTEMPTS,
+          params.deliveryQueueStateDir,
+          producerClaimId,
+          params.deliveryQueueStateContext,
+        );
+        if (reservation.status === "exhausted") {
+          throw new Error("delivery retry budget exhausted");
+        }
+        const results = await deliverWithProducerLease(
+          {
+            ...claimedDeliveryParams,
+            deliveryProducerLeaseRequired: true,
+            onPayloadDeliveryOutcome: (outcome) => outcomes.push(outcome),
+            onError: (error, payload) => {
+              finalError = [error, payload];
+            },
+          },
+          queueId,
+          auditStartedAt,
+          producerClaimId,
+          queued?.created === true ? "captured" : "unbound",
+        );
+        for (const outcome of outcomes) {
+          claimedDeliveryParams.onPayloadDeliveryOutcome?.(outcome);
+        }
+        if (finalError) {
+          claimedDeliveryParams.onError?.(...finalError);
+        }
+        return results;
+      } catch (error) {
+        const recovered = params.deliveryQueueStateContext
+          ? await recoverLiveFinalDelivery(
+              {
+                entryId: queueId,
+                cfg: params.cfg,
+                stateDir: params.deliveryQueueStateDir,
+                log,
+                shouldContinue: () => !params.abortSignal?.aborted,
+                deliver: (recoveryParams) =>
+                  runOutboundDeliveryInternal(
+                    {
+                      ...recoveryParams,
+                      deps: claimedDeliveryParams.deps,
+                      abortSignal:
+                        claimedDeliveryParams.abortSignal && recoveryParams.abortSignal
+                          ? AbortSignal.any([
+                              claimedDeliveryParams.abortSignal,
+                              recoveryParams.abortSignal,
+                            ])
+                          : (claimedDeliveryParams.abortSignal ?? recoveryParams.abortSignal),
+                      assertDirectAdapterHandoff: () => {
+                        recoveryParams.assertDirectAdapterHandoff?.();
+                        claimedDeliveryParams.assertDirectAdapterHandoff?.();
+                      },
+                      onPlatformSendDispatch: async () => {
+                        await recoveryParams.onPlatformSendDispatch?.();
+                        await claimedDeliveryParams.onPlatformSendDispatch?.();
+                      },
+                      onError: (retryError, payload) => {
+                        finalError = [retryError, payload];
+                      },
+                    },
+                    params.deliveryQueueStateContext,
+                  ),
               },
-            );
-          }
+              params.deliveryQueueStateContext,
+            )
+          : { status: "not-attempted" as const };
+        if (recovered.status !== "not-attempted") {
+          outcomes.length = 0;
+          outcomes.push(...recovered.payloadOutcomes);
         }
+        for (const outcome of outcomes) {
+          claimedDeliveryParams.onPayloadDeliveryOutcome?.(outcome);
+        }
+        if (recovered.status === "recovered") {
+          return recovered.results;
+        }
+        if (finalError) {
+          claimedDeliveryParams.onError?.(...finalError);
+        }
+        if (recovered.status === "failed") {
+          recoveredFailure = recovered.error;
+          throw recovered.error;
+        }
+        throw error;
       }
-    } else {
-      emitTerminals(() =>
-        failedOutboundAuditTerminals({
-          payloadCount: params.payloads.length,
-          results: deliveredResults,
-          payloadOutcomes: auditPayloadOutcomes ?? [],
-          failureStage: err instanceof OutboundDeliveryError ? err.stage : "platform_send",
-        }),
-      );
+    };
+    if (stableIntentClaimHeld) {
+      return await deliverClaimedIntent();
     }
-    throw err;
+    const claimResult = await withActiveDeliveryClaim(queueId, deliverClaimedIntent);
+    if (claimResult.status === "claimed") {
+      return claimResult.value;
+    }
+    if (params.reusePendingDeliveryIntent) {
+      return [];
+    }
+    throw new Error(`Delivery intent is already claimed: ${queueId}`);
+  } catch (error) {
+    if (recoveredFailure !== undefined && error === recoveredFailure) {
+      throw error;
+    }
+    throw queueOwner
+      ? queueOwner.project(error, {
+          sentBeforeError:
+            existingStableDelivery?.recoveryState === "send_attempt_started" ||
+            existingStableDelivery?.recoveryState === "unknown_after_send",
+        })
+      : error;
   }
 }
-
-/** Core delivery logic (extracted for queue wrapper). */

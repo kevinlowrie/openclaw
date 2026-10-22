@@ -1,14 +1,19 @@
 import type { SessionRestartRecoveryState } from "./restart-recovery-types.js";
-import type { InternalSessionEntry as SessionEntry } from "./types.js";
+import type { InternalSessionEntry as SessionEntry, PersistedSessionRunStatus } from "./types.js";
 
-type SessionRunStatus = "running" | "done" | "failed" | "killed" | "timeout";
+/** `null` requires a revision-less row; omitting the field skips the revision fence. */
+export type SessionLifecycleRevisionExpectation = string | null;
 
 /** Authoritative lifecycle snapshot required for an atomic transcript admission. */
 export type SessionTranscriptTurnExpectedState = {
+  /** When supplied, fences exact pending-final custody; null requires its absence. */
+  pendingFinalDelivery?: SessionEntry["pendingFinalDelivery"] | null;
+  /** Rejects a run-owned turn after another admitted run takes writer ownership. */
+  expectedWriterRunId?: string;
   abortedLastRun: boolean | undefined;
   /** Fences recovery-only transcript writes against concurrent ownership changes. */
-  mainRestartRecoveryCycleId?: string;
-  mainRestartRecoveryRevision?: number;
+  mainRestartRecoveryCycleId: string | undefined;
+  mainRestartRecoveryRevision: number | undefined;
   restartRecoveryBeforeAgentReplyState: SessionRestartRecoveryState["restartRecoveryBeforeAgentReplyState"];
   restartRecoveryDeliveryReceiptState: SessionRestartRecoveryState["restartRecoveryDeliveryReceiptState"];
   restartRecoveryDeliveryToolCallId: SessionRestartRecoveryState["restartRecoveryDeliveryToolCallId"];
@@ -18,17 +23,22 @@ export type SessionTranscriptTurnExpectedState = {
   restartRecoveryRequesterAccountId: SessionRestartRecoveryState["restartRecoveryRequesterAccountId"];
   restartRecoveryRequesterSenderId: SessionRestartRecoveryState["restartRecoveryRequesterSenderId"];
   restartRecoverySameChannelThreadRequired: SessionRestartRecoveryState["restartRecoverySameChannelThreadRequired"];
+  restartRecoveryOperatorSource: SessionEntry["restartRecoveryOperatorSource"];
+  restartRecoveryRequesterSource?: SessionEntry["restartRecoveryRequesterSource"];
   restartRecoverySourceIngress: SessionRestartRecoveryState["restartRecoverySourceIngress"];
   restartRecoverySourceReplyDeliveryMode: SessionRestartRecoveryState["restartRecoverySourceReplyDeliveryMode"];
   restartRecoveryTerminalRunIds: SessionRestartRecoveryState["restartRecoveryTerminalRunIds"];
-  status: SessionRunStatus | undefined;
-  updatedAt: number;
+  status: PersistedSessionRunStatus | undefined;
 };
 
 /** Lifecycle fields committed with an accepted transcript turn. */
 export type SessionTranscriptTurnLifecyclePatch = {
   abortedLastRun?: boolean;
   endedAt?: number;
+  lifecycleRunId?: SessionEntry["lifecycleRunId"];
+  lastRunId?: SessionEntry["lastRunId"];
+  lastRunError?: SessionEntry["lastRunError"];
+  lastInteractionAt?: number;
   pendingFinalDelivery?: SessionEntry["pendingFinalDelivery"];
   mainRestartRecovery?: SessionEntry["mainRestartRecovery"];
   restartRecoveryBeforeAgentReplyState?: SessionRestartRecoveryState["restartRecoveryBeforeAgentReplyState"];
@@ -41,6 +51,8 @@ export type SessionTranscriptTurnLifecyclePatch = {
   restartRecoveryRequesterAccountId?: SessionRestartRecoveryState["restartRecoveryRequesterAccountId"];
   restartRecoveryRequesterSenderId?: SessionRestartRecoveryState["restartRecoveryRequesterSenderId"];
   restartRecoverySameChannelThreadRequired?: SessionRestartRecoveryState["restartRecoverySameChannelThreadRequired"];
+  restartRecoveryOperatorSource?: SessionEntry["restartRecoveryOperatorSource"];
+  restartRecoveryRequesterSource?: SessionEntry["restartRecoveryRequesterSource"];
   restartRecoverySourceIngress?: SessionRestartRecoveryState["restartRecoverySourceIngress"];
   restartRecoverySourceReplyDeliveryMode?: SessionRestartRecoveryState["restartRecoverySourceReplyDeliveryMode"];
   restartRecoveryForceSafeTools?: SessionEntry["restartRecoveryForceSafeTools"];
@@ -49,6 +61,6 @@ export type SessionTranscriptTurnLifecyclePatch = {
   restartRecoveryTerminalRunIds?: SessionRestartRecoveryState["restartRecoveryTerminalRunIds"];
   runtimeMs?: number;
   startedAt?: number;
-  status?: SessionRunStatus;
+  status?: PersistedSessionRunStatus;
   updatedAt?: number;
 };

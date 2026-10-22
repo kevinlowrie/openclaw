@@ -1,65 +1,58 @@
-// Shared Control UI plugin catalog Gateway contracts.
-import {
-  ClawHubTrustErrorCodes,
-  readClawHubTrustErrorDetails,
-  type ClawHubTrustErrorDetails,
-} from "../../../../packages/gateway-protocol/src/clawhub-trust-error-details.js";
 import type {
-  PluginCatalogEntry,
-  PluginsInstallParams,
   PluginsInstallResult,
-  PluginsListResult as ProtocolPluginsListResult,
-  PluginsSearchResult as ProtocolPluginsSearchResult,
-  PluginsSetEnabledResult,
-  PluginsUninstallResult,
+  PluginsCatalogGetResult,
+  PluginsListResult,
+  PluginsSetEnabledParams,
 } from "../../../../packages/gateway-protocol/src/schema/plugins.js";
-import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
+import type { GatewayBrowserClient } from "../../api/gateway.ts";
+import { createConfigMutationRunner } from "../config/config-mutation-runner.ts";
 
-export type PluginCatalogItem = PluginCatalogEntry;
-export type PluginListResult = ProtocolPluginsListResult;
-export type PluginSearchResult = ProtocolPluginsSearchResult["results"][number];
-export type PluginInstallRequest = PluginsInstallParams;
-export type PluginMutationResult = PluginsInstallResult | PluginsSetEnabledResult;
-type PluginUninstallResult = PluginsUninstallResult;
+export type {
+  PluginCatalogEntry as PluginCatalogItem,
+  PluginDiscoveryCategory,
+  PluginDiscoveryEntry,
+  PluginDeclaredSurface,
+  PluginHookGrant,
+  PluginInspectSource,
+  PluginOperatorGrants,
+  PluginsInspectResult,
+  PluginsInstallParams as PluginInstallRequest,
+  PluginsCatalogBrowseResult as PluginDiscoveryResult,
+  PluginsCatalogGetResult as PluginDiscoveryDetailResult,
+  PluginsListResult as PluginListResult,
+} from "../../../../packages/gateway-protocol/src/schema/plugins.js";
+export type PluginMutationResult = PluginsInstallResult;
 
-export const CLAWHUB_BROWSE_URL = "https://clawhub.ai/plugins";
-
-export function loadPluginCatalog(client: GatewayBrowserClient): Promise<PluginListResult> {
-  return client.request<PluginListResult>("plugins.list", {});
+export function loadPluginCatalog(client: GatewayBrowserClient): Promise<PluginsListResult> {
+  return client.request<PluginsListResult>("plugins.list", {});
 }
 
-export function installPlugin(
+export function loadPluginDiscoveryDetail(
   client: GatewayBrowserClient,
-  request: PluginInstallRequest,
-): Promise<PluginMutationResult> {
-  return client.request<PluginMutationResult>("plugins.install", request);
-}
-
-export function uninstallPlugin(
-  client: GatewayBrowserClient,
-  pluginId: string,
-): Promise<PluginUninstallResult> {
-  return client.request<PluginUninstallResult>("plugins.uninstall", { pluginId });
+  id: string,
+  signal?: AbortSignal,
+  version?: string,
+): Promise<PluginsCatalogGetResult> {
+  return client.request<PluginsCatalogGetResult>(
+    "plugins.catalog.get",
+    { id, ...(version ? { version } : {}) },
+    signal ? { signal } : undefined,
+  );
 }
 
 export function setPluginEnabled(
   client: GatewayBrowserClient,
   pluginId: string,
   enabled: boolean,
+  options?: Pick<PluginsSetEnabledParams, "acknowledgeCapabilities">,
 ): Promise<PluginMutationResult> {
-  return client.request<PluginMutationResult>("plugins.setEnabled", { pluginId, enabled });
+  return client.request<PluginMutationResult>("plugins.setEnabled", {
+    pluginId,
+    enabled,
+    ...options,
+  });
 }
 
-export function readPluginInstallTrustError(error: unknown): ClawHubTrustErrorDetails | undefined {
-  if (!(error instanceof GatewayRequestError)) {
-    return undefined;
-  }
-  return readClawHubTrustErrorDetails(error.details);
-}
-
-export function pluginInstallNeedsRiskAcknowledgement(error: unknown): boolean {
-  return (
-    readPluginInstallTrustError(error)?.clawhubTrustCode ===
-    ClawHubTrustErrorCodes.RISK_ACKNOWLEDGEMENT_REQUIRED
-  );
-}
+export const runPluginConfigMutation = createConfigMutationRunner(
+  "Connection changed before the plugin update started.",
+);

@@ -1,5 +1,6 @@
 // Process-local node state shared by node and full-device pairing removal.
 import { randomUUID } from "node:crypto";
+import { resolveGlobalMap } from "../shared/global-singleton.js";
 import { removeRemoteNodeInfo } from "../skills/runtime/remote.js";
 import { clearNodePendingWork } from "./node-pending-work.js";
 import type { NodeRegistry } from "./node-registry.js";
@@ -7,7 +8,6 @@ import { invalidateNodeWakeState } from "./node-wake-state.js";
 
 export type PendingNodeAction = {
   id: string;
-  nodeId: string;
   pairingGeneration: string;
   command: string;
   paramsJSON?: string;
@@ -15,7 +15,10 @@ export type PendingNodeAction = {
   enqueuedAtMs: number;
 };
 
-const pendingNodeActionsById = new Map<string, PendingNodeAction[]>();
+const pendingNodeActionsById = resolveGlobalMap<string, PendingNodeAction[]>(
+  Symbol.for("openclaw.pendingNodeActions"),
+  "close-and-restart",
+);
 
 function prunePendingNodeActions(params: {
   nodeId: string;
@@ -82,7 +85,6 @@ export function enqueuePendingNodeAction(params: {
   }
   const action: PendingNodeAction = {
     id: randomUUID(),
-    nodeId: params.nodeId,
     pairingGeneration: params.pairingGeneration,
     command: params.command,
     paramsJSON: params.paramsJSON,
@@ -163,17 +165,13 @@ export function removePendingNodeAction(params: {
   });
 }
 
-function clearPendingNodeActions(nodeId: string): void {
-  pendingNodeActionsById.delete(nodeId);
-}
-
 export function clearRemovedNodeRuntimeState(params: {
   nodeId: string;
   context: {
     nodeRegistry: Pick<NodeRegistry, "updateSurface">;
   };
 }) {
-  clearPendingNodeActions(params.nodeId);
+  pendingNodeActionsById.delete(params.nodeId);
   clearNodePendingWork(params.nodeId);
   invalidateNodeWakeState(params.nodeId);
   params.context.nodeRegistry.updateSurface(params.nodeId, {

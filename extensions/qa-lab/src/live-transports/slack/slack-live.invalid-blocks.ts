@@ -1,4 +1,3 @@
-// QA Lab Slack invalid-blocks fallback fixture.
 import { randomUUID } from "node:crypto";
 import {
   SLACK_QA_INVALID_TABLE_DATA_ROW_COUNT,
@@ -8,7 +7,8 @@ import {
 
 function buildSlackInvalidBlocksTableRow(index: number) {
   const rowId = String(index).padStart(3, "0");
-  return [`row-${rowId}`, `value-${rowId}`] as const;
+  // Keep the fallback large enough to catch accidental truncation.
+  return [`row-${rowId}`, `value-${rowId}-${"x".repeat(96)}`] as const;
 }
 
 export function buildSlackInvalidBlocksTableProbe() {

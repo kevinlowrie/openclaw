@@ -1,55 +1,43 @@
-/** Process-local cron operation serialization by store path. */
-import { readlinkSync, realpathSync } from "node:fs";
-import path from "node:path";
+/** Process-local cron operation serialization by SQLite store partition. */
+import { KeyedAsyncQueue } from "../../plugin-sdk/keyed-async-queue.js";
+import { cronStoreKey } from "../store/key.js";
 import type { CronServiceState } from "./state.js";
 
-const storeLocks = new Map<string, Promise<void>>();
-const storeLockPaths = new WeakMap<CronServiceState, string>();
+const cronOperations = new KeyedAsyncQueue();
+type PendingCronSessionCleanup = { done: Promise<void>; agentId: string };
+const pendingSessionCleanups = new Map<string, Map<string, PendingCronSessionCleanup>>();
 
-function resolveStoreLockPath(storePath: string): string {
-  let existingPath = path.resolve(storePath);
-  const missingSegments: string[] = [];
-
-  while (true) {
-    try {
-      // Stores may not exist on first startup. Canonicalize their closest
-      // existing ancestor once so symlink aliases still share one lock.
-      return path.join(realpathSync.native(existingPath), ...missingSegments.toReversed());
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT" && code !== "ENOTDIR") {
-        throw error;
-      }
-      try {
-        // realpath cannot resolve a store-file symlink before its target is
-        // created; follow that link before choosing the lock identity.
-        const targetPath = readlinkSync(existingPath);
-        existingPath = path.resolve(path.dirname(existingPath), targetPath);
-        continue;
-      } catch (linkError) {
-        const linkCode = (linkError as NodeJS.ErrnoException).code;
-        if (linkCode !== "EINVAL" && linkCode !== "ENOENT" && linkCode !== "ENOTDIR") {
-          throw linkError;
-        }
-      }
-      const parentPath = path.dirname(existingPath);
-      if (parentPath === existingPath) {
-        return path.resolve(storePath);
-      }
-      missingSegments.push(path.basename(existingPath));
-      existingPath = parentPath;
-    }
-  }
+/** Returns cleanup that must finish before the same durable job identity can be reused. */
+export function getPendingCronSessionCleanup(
+  state: CronServiceState,
+  jobId: string,
+): Promise<void> | undefined {
+  return pendingSessionCleanups.get(cronStoreKey(state.deps.storePath))?.get(jobId)?.done;
 }
 
-function getStoreLockPath(state: CronServiceState): string {
-  const cachedPath = storeLockPaths.get(state);
-  if (cachedPath) {
-    return cachedPath;
+/** Registers cleanup at the store-partition owner shared by sibling service instances. */
+export function registerPendingCronSessionCleanup(
+  state: CronServiceState,
+  jobId: string,
+  done: Promise<void>,
+  agentId: string,
+): () => void {
+  const storeKey = cronStoreKey(state.deps.storePath);
+  let byJobId = pendingSessionCleanups.get(storeKey);
+  if (!byJobId) {
+    byJobId = new Map<string, PendingCronSessionCleanup>();
+    pendingSessionCleanups.set(storeKey, byJobId);
   }
-  const resolvedPath = resolveStoreLockPath(state.deps.storePath);
-  storeLockPaths.set(state, resolvedPath);
-  return resolvedPath;
+  byJobId.set(jobId, { done, agentId });
+  return () => {
+    if (byJobId.get(jobId)?.done !== done) {
+      return;
+    }
+    byJobId.delete(jobId);
+    if (byJobId.size === 0) {
+      pendingSessionCleanups.delete(storeKey);
+    }
+  };
 }
 
 const resolveChain = (promise: Promise<unknown>) =>
@@ -58,24 +46,21 @@ const resolveChain = (promise: Promise<unknown>) =>
     () => undefined,
   );
 
-/** Serializes cron operations per store path while preserving state-local operation ordering. */
-export async function locked<T>(state: CronServiceState, fn: () => Promise<T>): Promise<T> {
-  const storePath = getStoreLockPath(state);
-  const storeOp = storeLocks.get(storePath) ?? Promise.resolve();
-  const next = Promise.all([resolveChain(state.op), resolveChain(storeOp)]).then(fn);
-
-  // Store locks are process-local; keep the chain alive after failures so the
-  // next operation for this store still waits for the failed one to settle.
-  const keepAlive = resolveChain(next);
-  state.op = keepAlive;
-  storeLocks.set(storePath, keepAlive);
-
-  void keepAlive.finally(() => {
-    // A newer operation may already own this store; never remove its chain.
-    if (storeLocks.get(storePath) === keepAlive) {
-      storeLocks.delete(storePath);
+/** Serializes operations by their actual SQLite partition and service-local order. */
+export async function locked<T>(
+  state: CronServiceState,
+  fn: () => Promise<T>,
+  opts?: { readOnly?: boolean },
+): Promise<T> {
+  const previous = state.op;
+  const next = cronOperations.enqueue(cronStoreKey(state.deps.storePath), async () => {
+    await resolveChain(previous);
+    if (!opts?.readOnly) {
+      // Include scheduler-local changes that deliberately do not commit a store revision.
+      state.readSnapshot = undefined;
     }
+    return await fn();
   });
-
+  state.op = resolveChain(next);
   return await next;
 }

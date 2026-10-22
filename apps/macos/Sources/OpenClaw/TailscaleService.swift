@@ -4,39 +4,36 @@ import Observation
 import OpenClawDiscovery
 import os
 
-/// Manages Tailscale integration and status checking.
 @Observable
 @MainActor
 final class TailscaleService {
+    typealias InstallationProbe = @Sendable () -> Bool
+    typealias StatusDataLoader = @Sendable (URL) async throws -> (Data, URLResponse)
+
     static let shared = TailscaleService()
 
-    /// Tailscale local API endpoint.
     private static let tailscaleAPIEndpoint = "http://100.100.100.100/api/data"
 
-    /// API request timeout in seconds.
-    private static let apiTimeoutInterval: TimeInterval = 5.0
+    private nonisolated static let apiTimeoutInterval: TimeInterval = 5.0
 
     private let logger = Logger(subsystem: "ai.openclaw", category: "tailscale")
 
-    /// Indicates if a Tailscale installation or active daemon was detected.
     private(set) var isInstalled = false
-
-    /// Indicates if the GUI app is available for app-specific actions.
     private(set) var isAppInstalled = false
-
-    /// Indicates if Tailscale is currently running.
     private(set) var isRunning = false
-
-    /// The Tailscale hostname for this device (e.g., "my-mac.tailnet.ts.net").
     private(set) var tailscaleHostname: String?
-
-    /// The Tailscale IPv4 address for this device.
     private(set) var tailscaleIP: String?
-
-    /// Error message if status check fails.
     private(set) var statusError: String?
 
+    @ObservationIgnored private let appInstallationProbe: InstallationProbe
+    @ObservationIgnored private let cliInstallationProbe: InstallationProbe
+    @ObservationIgnored private let statusDataLoader: StatusDataLoader
+    @ObservationIgnored private var statusCheckTask: Task<Void, Never>?
+
     private init() {
+        self.appInstallationProbe = Self.detectAppInstallation
+        self.cliInstallationProbe = Self.detectCLIInstallation
+        self.statusDataLoader = Self.makeStatusDataLoader()
         Task { await self.checkTailscaleStatus() }
     }
 
@@ -47,7 +44,10 @@ final class TailscaleService {
         isRunning: Bool,
         tailscaleHostname: String? = nil,
         tailscaleIP: String? = nil,
-        statusError: String? = nil)
+        statusError: String? = nil,
+        appInstallationProbe: @escaping InstallationProbe = TailscaleService.detectAppInstallation,
+        cliInstallationProbe: @escaping InstallationProbe = TailscaleService.detectCLIInstallation,
+        statusDataLoader: @escaping StatusDataLoader = TailscaleService.makeStatusDataLoader())
     {
         self.isInstalled = isInstalled
         self.isAppInstalled = isAppInstalled
@@ -55,31 +55,13 @@ final class TailscaleService {
         self.tailscaleHostname = tailscaleHostname
         self.tailscaleIP = tailscaleIP
         self.statusError = statusError
+        self.appInstallationProbe = appInstallationProbe
+        self.cliInstallationProbe = cliInstallationProbe
+        self.statusDataLoader = statusDataLoader
     }
     #endif
 
-    func checkAppInstallation() -> Bool {
-        let installed = FileManager().fileExists(atPath: "/Applications/Tailscale.app")
-        self.logger.info("Tailscale app installed: \(installed)")
-        return installed
-    }
-
-    func checkCLIInstallation() -> Bool {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let candidates = [
-            "/usr/local/bin/tailscale",
-            "/usr/local/bin/tailscaled",
-            "/opt/homebrew/bin/tailscale",
-            "/opt/homebrew/bin/tailscaled",
-            "\(home)/go/bin/tailscale",
-            "\(home)/go/bin/tailscaled",
-        ]
-        let installed = Self.hasExecutableCLI(at: candidates)
-        self.logger.info("Tailscale CLI installed: \(installed)")
-        return installed
-    }
-
-    static func hasExecutableCLI(at candidates: [String]) -> Bool {
+    nonisolated static func hasExecutableCLI(at candidates: [String]) -> Bool {
         candidates.contains { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
@@ -104,11 +86,7 @@ final class TailscaleService {
         }
 
         do {
-            let configuration = URLSessionConfiguration.default
-            configuration.timeoutIntervalForRequest = Self.apiTimeoutInterval
-            let session = URLSession(configuration: configuration)
-
-            let (data, response) = try await session.data(from: url)
+            let (data, response) = try await self.statusDataLoader(url)
             guard let httpResponse = response as? HTTPURLResponse,
                   httpResponse.statusCode == 200
             else {
@@ -125,9 +103,28 @@ final class TailscaleService {
     }
 
     func checkTailscaleStatus() async {
+        // Every caller that awaits a refresh must observe the same completed
+        // status update; returning early here would expose stale state.
+        if let statusCheckTask = self.statusCheckTask {
+            await statusCheckTask.value
+            return
+        }
+
+        let statusCheckTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performTailscaleStatusCheck()
+        }
+        self.statusCheckTask = statusCheckTask
+        await statusCheckTask.value
+        self.statusCheckTask = nil
+    }
+
+    private func performTailscaleStatusCheck() async {
         let previousIP = self.tailscaleIP
-        let appInstalled = self.checkAppInstallation()
-        let cliInstalled = self.checkCLIInstallation()
+        let appInstalled = self.appInstallationProbe()
+        self.logger.info("Tailscale app installed: \(appInstalled)")
+        let cliInstalled = self.cliInstallationProbe()
+        self.logger.info("Tailscale CLI installed: \(cliInstalled)")
         let apiResponse = await self.fetchTailscaleStatus()
         self.applyStatusEvidence(
             appInstalled: appInstalled,
@@ -201,29 +198,51 @@ final class TailscaleService {
 
     func openTailscaleApp() {
         if let url = URL(string: "file:///Applications/Tailscale.app") {
-            NSWorkspace.shared.open(url)
+            AppActivation.shared.open(url)
         }
     }
 
     func openAppStore() {
         if let url = URL(string: "https://apps.apple.com/us/app/tailscale/id1475387142") {
-            NSWorkspace.shared.open(url)
+            AppActivation.shared.open(url)
         }
     }
 
     func openDownloadPage() {
         if let url = URL(string: "https://tailscale.com/download/macos") {
-            NSWorkspace.shared.open(url)
+            AppActivation.shared.open(url)
         }
     }
 
     func openSetupGuide() {
         if let url = URL(string: "https://tailscale.com/kb/1017/install/") {
-            NSWorkspace.shared.open(url)
+            AppActivation.shared.open(url)
         }
     }
 
-    nonisolated static func fallbackTailnetIPv4() -> String? {
-        TailscaleNetwork.detectTailnetIPv4()
+    private nonisolated static func detectAppInstallation() -> Bool {
+        FileManager().fileExists(atPath: "/Applications/Tailscale.app")
+    }
+
+    private nonisolated static func detectCLIInstallation() -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let candidates = [
+            "/usr/local/bin/tailscale",
+            "/usr/local/bin/tailscaled",
+            "/opt/homebrew/bin/tailscale",
+            "/opt/homebrew/bin/tailscaled",
+            "\(home)/go/bin/tailscale",
+            "\(home)/go/bin/tailscaled",
+        ]
+        return Self.hasExecutableCLI(at: candidates)
+    }
+
+    private nonisolated static func makeStatusDataLoader() -> StatusDataLoader {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = Self.apiTimeoutInterval
+        let session = URLSession(configuration: configuration)
+        return { url in
+            try await session.data(from: url)
+        }
     }
 }

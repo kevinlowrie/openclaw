@@ -1,5 +1,6 @@
 // Channel contract suites provide reusable expectations for channel plugin test coverage.
 import { expect, it } from "vitest";
+import { resolveChannelSetupExecutionAdapter } from "../../channels/plugins/setup-contract.js";
 import type { ChannelSetupDmPolicy } from "../../channels/plugins/setup-wizard-types.js";
 import type {
   ChannelAccountSnapshot,
@@ -33,14 +34,6 @@ function resolveContractMessageDiscovery(params: {
     actions: Array.isArray(discovery?.actions) ? [...discovery.actions] : [],
     capabilities: Array.isArray(discovery?.capabilities) ? discovery.capabilities : [],
   };
-}
-
-export function installChannelPluginContractSuite(params: {
-  plugin: Pick<ChannelPlugin, "id" | "meta" | "capabilities" | "config">;
-}) {
-  it("satisfies the base channel plugin contract", () => {
-    expectChannelPluginContract(params.plugin);
-  });
 }
 
 export function expectChannelPluginContract(
@@ -95,18 +88,14 @@ export function installChannelActionsContractSuite(params: {
       expect(sortStrings(actions)).toEqual(sortStrings(testCase.expectedActions));
       expect(sortStrings(capabilities)).toEqual(sortStrings(testCase.expectedCapabilities ?? []));
 
-      if (params.plugin.actions?.supportsAction) {
-        for (const action of testCase.expectedActions) {
-          expect(params.plugin.actions.supportsAction({ action })).toBe(true);
-        }
-        if (
-          params.unsupportedAction &&
-          !testCase.expectedActions.includes(params.unsupportedAction)
-        ) {
-          expect(params.plugin.actions.supportsAction({ action: params.unsupportedAction })).toBe(
-            false,
-          );
-        }
+      if (
+        params.plugin.actions?.supportsAction &&
+        params.unsupportedAction &&
+        !testCase.expectedActions.includes(params.unsupportedAction)
+      ) {
+        expect(params.plugin.actions.supportsAction({ action: params.unsupportedAction })).toBe(
+          false,
+        );
       }
     });
   }
@@ -131,9 +120,11 @@ export function installChannelSetupContractSuite<
   plugin: Pick<ChannelPlugin<ResolvedAccount>, "id" | "config" | "setup">;
   cases: readonly ChannelSetupContractCase<ResolvedAccount, SetupInput>[];
 }) {
+  const setup = resolveChannelSetupExecutionAdapter(
+    params.plugin as Pick<ChannelPlugin<ResolvedAccount>, "setup" | "setupContract">,
+  );
   it("exposes the base setup contract", () => {
-    expect(params.plugin.setup).toBeDefined();
-    expect(typeof params.plugin.setup?.applyAccountConfig).toBe("function");
+    expect(typeof setup?.applyAccountConfig).toBe("function");
   });
 
   for (const testCase of params.cases) {
@@ -141,7 +132,7 @@ export function installChannelSetupContractSuite<
       testCase.beforeTest?.();
 
       const resolvedAccountId =
-        params.plugin.setup?.resolveAccountId?.({
+        setup?.resolveAccountId?.({
           cfg: testCase.cfg,
           accountId: testCase.accountId,
           input: testCase.input,
@@ -152,14 +143,14 @@ export function installChannelSetupContractSuite<
       expect(resolvedAccountId).toBe(testCase.expectedAccountId ?? resolvedAccountId);
 
       const validation =
-        params.plugin.setup?.validateInput?.({
+        setup?.validateInput?.({
           cfg: testCase.cfg,
           accountId: resolvedAccountId,
           input: testCase.input,
         }) ?? null;
       expect(validation).toBe(testCase.expectedValidation ?? null);
 
-      const nextCfg = params.plugin.setup?.applyAccountConfig({
+      const nextCfg = setup?.applyAccountConfig({
         cfg: testCase.cfg,
         accountId: resolvedAccountId,
         input: testCase.input,

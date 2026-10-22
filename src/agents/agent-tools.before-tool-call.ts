@@ -16,9 +16,9 @@ export {
   consumeAdjustedParamsForToolCall,
   consumePreExecutionBlockedToolCall,
   peekAdjustedParamsForToolCall,
+  recordAdjustedParamsForToolCall,
 } from "./agent-tools.before-tool-call.state.js";
 export {
-  copyBeforeToolCallHookMarker,
   isToolWrappedWithBeforeToolCallHook,
   setBeforeToolCallDiagnosticsEnabled,
 } from "./before-tool-call-metadata.js";
@@ -35,9 +35,6 @@ export {
 export {
   buildBlockedToolResult,
   getBeforeToolCallFailureDisposition,
-  isBeforeToolCallBlockedError,
-  isPreExecutionBlockedToolResult,
-  recordAdjustedParamsForToolCall,
   recordStructuredReplayTrustForToolCall,
   rewrapToolWithBeforeToolCallHook,
   wrapToolWithBeforeToolCallHook,

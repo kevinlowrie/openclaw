@@ -1,4 +1,8 @@
-// Defines shared legacy config rule contracts for detection and migration.
+import { asNullableRecord as getRecord } from "@openclaw/normalization-core/record-coerce";
+import { isSafeExecutableValue } from "../infra/exec-safety.js";
+
+export { ensureRecord } from "@openclaw/normalization-core/record-coerce";
+export { getRecord };
 export type LegacyConfigRule = {
   path: string[];
   message: string;
@@ -8,50 +12,33 @@ export type LegacyConfigRule = {
   requireSourceLiteral?: boolean;
 };
 
-type LegacyConfigMigration = {
+export const createLegacyConfigRule = (
+  path: string[],
+  message: string,
+  match?: LegacyConfigRule["match"],
+): LegacyConfigRule => ({
+  path,
+  message: `${message} Run "openclaw doctor --fix".`,
+  ...(match ? { match } : {}),
+});
+
+export type LegacyConfigMigrationContext = {
+  /** Parsed configuration exactly as authored in the root config file. */
+  authoredRaw: unknown;
+  /** Configuration after include and environment resolution. */
+  resolvedRaw: unknown;
+  env?: NodeJS.ProcessEnv;
+  homedir?: () => string;
+};
+
+export type LegacyConfigMigrationSpec = {
   id: string;
-  describe: string;
-  apply: (raw: Record<string, unknown>, changes: string[]) => void;
-};
-
-export type LegacyConfigMigrationSpec = LegacyConfigMigration & {
   legacyRules?: LegacyConfigRule[];
-};
-
-import { isSafeExecutableValue } from "../infra/exec-safety.js";
-import { isBlockedObjectKey } from "../infra/prototype-keys.js";
-import { isRecord } from "../utils.js";
-
-export const getRecord = (value: unknown): Record<string, unknown> | null =>
-  isRecord(value) ? value : null;
-
-export const ensureRecord = (
-  root: Record<string, unknown>,
-  key: string,
-): Record<string, unknown> => {
-  const existing = root[key];
-  if (isRecord(existing)) {
-    return existing;
-  }
-  const next: Record<string, unknown> = {};
-  root[key] = next;
-  return next;
-};
-
-export const mergeMissing = (target: Record<string, unknown>, source: Record<string, unknown>) => {
-  for (const [key, value] of Object.entries(source)) {
-    if (value === undefined || isBlockedObjectKey(key)) {
-      continue;
-    }
-    const existing = target[key];
-    if (existing === undefined) {
-      target[key] = value;
-      continue;
-    }
-    if (isRecord(existing) && isRecord(value)) {
-      mergeMissing(existing, value);
-    }
-  }
+  apply: (
+    raw: Record<string, unknown>,
+    changes: string[],
+    context?: LegacyConfigMigrationContext,
+  ) => void;
 };
 
 export const mapLegacyAudioTranscription = (value: unknown): Record<string, unknown> | null => {
@@ -67,9 +54,6 @@ export const mapLegacyAudioTranscription = (value: unknown): Record<string, unkn
     return null;
   }
   const rawExecutable = command[0].trim();
-  if (!rawExecutable) {
-    return null;
-  }
   if (!isSafeExecutableValue(rawExecutable)) {
     return null;
   }
@@ -87,7 +71,3 @@ export const mapLegacyAudioTranscription = (value: unknown): Record<string, unkn
   }
   return result;
 };
-
-export const defineLegacyConfigMigration = (
-  migration: LegacyConfigMigrationSpec,
-): LegacyConfigMigrationSpec => migration;

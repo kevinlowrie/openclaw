@@ -1,18 +1,17 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   createTelegramQaTransportAdapter: vi.fn(),
+  listTelegramQaScenarios: vi.fn(),
   printLiveTransportQaArtifacts: vi.fn(),
-  resolveTelegramQaRunOptions: vi.fn(
-    (options: { allowFailures?: boolean; providerMode?: string; repoRoot: string }) => ({
-      ...options,
-      allowFailures: options.allowFailures ?? false,
-      listScenarios: false,
-    }),
-  ),
+  resolveTelegramQaRunOptions: vi.fn((options: Parameters<typeof runQaTelegramSuite>[0]) => ({
+    ...options,
+    allowFailures: options.allowFailures ?? false,
+    listScenarios: false,
+  })),
   resolveTelegramQaScenarioIds: vi.fn(),
   runQaFlowSuiteFromRuntime: vi.fn(),
 }));
@@ -34,81 +33,125 @@ vi.mock("./run-options.runtime.js", () => ({
 }));
 
 vi.mock("./scenario-selection.js", () => ({
-  listTelegramQaScenarios: vi.fn(),
+  listTelegramQaScenarios: mocks.listTelegramQaScenarios,
   resolveTelegramQaScenarioIds: mocks.resolveTelegramQaScenarioIds,
 }));
 
-import { runQaTelegramSuite } from "./cli.runtime.js";
+import { runQaTelegramCommand, runQaTelegramSuite } from "./cli.runtime.js";
 
-describe("Telegram live QA scenario gate", () => {
-  let previousExitCode: typeof process.exitCode;
-  let tempRoot: string;
-  let summaryPath: string;
+let previousExitCode: typeof process.exitCode;
+let tempRoot: string;
+let summaryPath: string;
 
-  function writeSummary(status: string) {
-    writeFileSync(
-      summaryPath,
-      JSON.stringify({
-        counts: {
-          failed: status === "fail" ? 1 : 0,
-          skipped: status === "skip" || status === "skipped" ? 1 : 0,
-        },
-        scenarios: [{ name: "channel-canary", status }],
-      }),
-      "utf8",
-    );
-  }
-
-  beforeEach(() => {
-    previousExitCode = process.exitCode;
-    process.exitCode = undefined;
-    vi.clearAllMocks();
-    tempRoot = mkdtempSync(path.join(tmpdir(), "openclaw-qa-telegram-gate-"));
-    summaryPath = path.join(tempRoot, "qa-suite-summary.json");
-    mocks.resolveTelegramQaScenarioIds.mockReturnValue(["channel-canary"]);
-    mocks.runQaFlowSuiteFromRuntime.mockResolvedValue({
-      reportPath: ".artifacts/qa-e2e/telegram/qa-suite-report.md",
-      summaryPath,
-    });
-  });
-
-  afterEach(() => {
-    process.exitCode = previousExitCode;
-    rmSync(tempRoot, { force: true, recursive: true });
-  });
-
-  it.each(["fail", "skip", "skipped", "timeout"])(
-    "fails the live Telegram lane on %s scenarios",
-    async (status) => {
-      writeSummary(status);
-
-      await runQaTelegramSuite({
-        repoRoot: "/repo",
-        providerMode: "mock-openai",
-      });
-
-      expect(process.exitCode).toBe(1);
+function writeSummary(status: string) {
+  const skipped = status === "skip" || status === "skipped";
+  const empty = status === "zero-work";
+  const summary = {
+    run: { status: "completed" },
+    counts: {
+      total: empty ? 0 : 1,
+      passed: Number(status === "pass"),
+      failed: Number(status === "fail"),
+      skipped: Number(skipped),
     },
+    scenarios: empty ? [] : [{ name: "channel-canary", status }],
+  };
+  writeFileSync(summaryPath, JSON.stringify(summary), "utf8");
+}
+
+const runSuite = (allowFailures = false) =>
+  runQaTelegramSuite({ repoRoot: "/repo", providerMode: "mock-openai", allowFailures });
+
+beforeEach(() => {
+  previousExitCode = process.exitCode;
+  // Bun does not clear a previous failure when assigned undefined.
+  process.exitCode = 0;
+  vi.clearAllMocks();
+  vi.stubEnv("OPENCLAW_QA_TELEGRAM_SUT_OPENCLAW_COMMAND", undefined);
+  tempRoot = mkdtempSync(path.join(tmpdir(), "openclaw-qa-telegram-gate-"));
+  summaryPath = path.join(tempRoot, "qa-suite-summary.json");
+  writeSummary("pass");
+  mocks.resolveTelegramQaScenarioIds.mockReturnValue(["channel-canary"]);
+  mocks.runQaFlowSuiteFromRuntime.mockResolvedValue({
+    reportPath: ".artifacts/qa-e2e/telegram/qa-suite-report.md",
+    summaryPath,
+  });
+});
+
+afterEach(() => {
+  process.exitCode = previousExitCode ?? 0;
+  rmSync(tempRoot, { force: true, recursive: true });
+  vi.unstubAllEnvs();
+});
+
+it.each([
+  { status: "fail", allowFailures: false, exitCode: 1 },
+  { status: "skip", allowFailures: false, exitCode: 1 },
+  { status: "fail", allowFailures: true, exitCode: 0 },
+])(
+  "gates $status with allowFailures=$allowFailures",
+  async ({ status, allowFailures, exitCode }) => {
+    writeSummary(status);
+    await runSuite(allowFailures);
+    expect(process.exitCode).toBe(exitCode);
+  },
+);
+
+it.each([
+  { summary: "missing", expected: "Could not read QA summary" },
+  { summary: "malformed", expected: "Could not parse QA summary" },
+  { summary: "zero-work", expected: "did not include any executed scenarios" },
+  { summary: "required-skip", expected: "did not include any executed scenarios" },
+])(
+  "rejects $summary Telegram summaries even with --allow-failures",
+  async ({ summary, expected }) => {
+    if (summary === "missing") {
+      rmSync(summaryPath);
+    } else if (summary === "malformed") {
+      writeFileSync(summaryPath, "{not-json", "utf8");
+    } else {
+      writeSummary(summary === "zero-work" ? summary : "skip");
+    }
+
+    await expect(runSuite(true)).rejects.toThrow(expected);
+    expect(process.exitCode).toBe(0);
+  },
+);
+
+it("lists only scenarios accepted by its flow runner", async () => {
+  const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  mocks.listTelegramQaScenarios.mockReturnValue([
+    { id: "flow", defaultEnabled: true, title: "Flow", rationale: "QA", regressionRefs: [] },
+  ]);
+  const options = {
+    listScenarios: true,
+    providerMode: "mock-openai",
+    repoRoot: process.cwd(),
+  };
+  mocks.resolveTelegramQaRunOptions.mockReturnValueOnce({ ...options, allowFailures: false });
+  await runQaTelegramSuite(options);
+
+  const output = write.mock.calls.map(([chunk]) => String(chunk)).join("");
+  expect(output).toContain("flow\tdefault\t");
+  expect(output).not.toContain("telegram-startup-getme-live");
+  expect(mocks.runQaFlowSuiteFromRuntime).not.toHaveBeenCalled();
+});
+
+it("selects scenarios against the exact requested model before suite startup", async () => {
+  await runQaTelegramCommand({
+    allowFailures: true,
+    primaryModel: "openai/custom-selection-model",
+    providerMode: "live-frontier",
+    repoRoot: process.cwd(),
+  });
+
+  expect(mocks.resolveTelegramQaScenarioIds).toHaveBeenCalledWith({
+    profile: undefined,
+    primaryModel: "openai/custom-selection-model",
+    providerMode: "live-frontier",
+    scenarioIds: undefined,
+  });
+  expect(mocks.runQaFlowSuiteFromRuntime).toHaveBeenCalledWith(
+    expect.objectContaining({ primaryModel: "openai/custom-selection-model" }),
   );
-
-  it("leaves the exit code clear when every Telegram scenario passes", async () => {
-    writeSummary("pass");
-
-    await runQaTelegramSuite({
-      repoRoot: "/repo",
-      providerMode: "mock-openai",
-    });
-
-    expect(process.exitCode).toBeUndefined();
-  });
-
-  it("does not read the summary when failures are explicitly allowed", async () => {
-    await runQaTelegramSuite({
-      repoRoot: "/repo",
-      providerMode: "mock-openai",
-      allowFailures: true,
-    });
-
-    expect(process.exitCode).toBeUndefined();
-  });
 });

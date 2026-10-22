@@ -55,21 +55,22 @@ openclaw wiki obsidian daily
 ## Agent selection
 
 When `plugins.entries.memory-wiki.config.vault.scope` is `agent`, select the
-vault with the top-level `--agent <id>` option:
+vault with the command's `--agent <id>` option:
 
 ```bash
-openclaw wiki --agent support status
-openclaw wiki --agent support search "refund policy"
-openclaw wiki --agent marketing ingest ./campaign-notes.md
+openclaw wiki status --agent support
+openclaw wiki search "refund policy" --agent support
+openclaw wiki ingest ./campaign-notes.md --agent marketing
 ```
 
-In a setup with multiple configured agents, `--agent` is required for CLI
-operations so a command cannot read or write an arbitrary default vault. If
-only one agent is configured, that agent remains the default. Unknown agent ids
-fail before the vault operation starts. The option does not change the selected
-path when `vault.scope` is `global`.
+When `--agent` is omitted, CLI operations use the configured default agent,
+matching other agent-scoped CLI families. Pass the flag to select a different
+agent. Unknown agent ids fail before the vault operation starts. If no default
+can be resolved, the error tells you to pass `--agent <id>` or configure an
+agent. The option does not change the selected path when `vault.scope` is
+`global`.
 
-Gateway clients follow the same rule: pass `agentId` on vault-backed `wiki.*`
+Gateway clients remain explicit: pass `agentId` on vault-backed `wiki.*`
 requests in an agent-scoped multi-agent setup. A missing or unknown id is an
 error. Agent turns, wiki tools, memory corpus supplements, and compiled prompt
 digests already carry the active runtime agent context.
@@ -102,7 +103,15 @@ Create the wiki vault layout and starter pages, including top-level indexes and 
 
 Import a local markdown or text file into the wiki `sources/` folder as a source page. `<path>` must be a local file path; there is no URL ingest today. Rejects binary files.
 
+Source files must be valid UTF-8. Malformed input is rejected without replacing an existing source page. Save the source as valid UTF-8 and retry the ingest.
+
+`wiki ingest`, bridge/unsafe-local sync, and ChatGPT imports also reject existing source pages with malformed UTF-8 instead of rewriting their human notes. Save the affected page as valid UTF-8 and retry.
+
 Imported source pages carry provenance frontmatter (`sourceType: local-file`, `sourcePath`, `ingestedAt`). Ingest always recompiles the vault afterward.
+
+Concurrent `wiki ingest` and Gateway bridge imports targeting the same vault wait
+for each other's source writes and compilation to finish. Ingest waits up to five
+minutes for a busy vault before reporting a lock timeout.
 
 Flags: `--title <title>` overrides the source title (default: derived from the filename).
 
@@ -111,6 +120,14 @@ Flags: `--title <title>` overrides the source title (default: derived from the f
 Import an unpacked Open Knowledge Format bundle into wiki concept pages.
 
 The importer reads every non-reserved `.md` concept document in the OKF directory tree, requires a non-empty `type` field, and treats unknown OKF `type` values as generic concepts. Reserved OKF `index.md` and `log.md` files are not imported as concepts.
+
+OKF documents, including the bundle's `index.md`, must contain valid UTF-8.
+Malformed concept documents are skipped with an `unreadable-entry` warning;
+other valid concepts still import. Any import warning also prevents stale-page
+pruning, so a damaged source cannot remove its previously imported concept.
+An unreadable root `index.md` stops the import before concept pages are changed,
+because that file determines the bundle identity. Convert the affected source
+to UTF-8 and retry the import.
 
 Imported pages are flattened under `concepts/` so existing wiki compile, search, get, digest, and dashboard flows see them immediately. The original OKF concept ID, `type`, `resource`, `tags`, timestamp, source path, and full frontmatter are preserved in the page frontmatter. Internal OKF markdown links are rewritten to the generated wiki pages; broken or external links are left unchanged. Import always recompiles the vault afterward.
 
@@ -154,7 +171,7 @@ Use `wiki search` for wiki-specific ranking and provenance. For one broad shared
 
 Search modes:
 
-- `find-person`: aliases, handles, socials, canonical IDs, and person pages
+- `find-person`: aliases, handles, socials, primary IDs, and person pages
 - `route-question`: ask-for/best-used-for hints and relationship context
 - `source-evidence`: source pages and structured evidence fields
 - `raw-claim`: structured claim text with claim/evidence metadata
@@ -172,7 +189,15 @@ Text output includes `Claim:` and `Evidence:` lines when a result matches a stru
 
 ### `wiki get <lookup>`
 
-Read a wiki page by id or relative path.
+Read a wiki page by id or relative path. Compiled claim IDs are resolved first.
+After vault activation, an existing, visible Markdown path reads only
+the requested page. A fresh CLI process still validates the compiled snapshot
+against the vault; missing indexes or snapshots can trigger automatic compilation.
+Missing or invalid candidates, extensionless paths, basenames, and page IDs
+retain their existing lookup fallbacks and may scan the vault.
+
+Wiki-page reads support large files and hard links. Reads refuse paths that
+escape the vault or pass through a symbolic link inside it.
 
 ```bash
 openclaw wiki get entity.alpha
@@ -214,9 +239,15 @@ openclaw wiki chatgpt import --export ./conversations.json --dry-run
 
 A non-dry-run import that changes any page records an import run id, printed in the summary, needed for rollback.
 
+Malformed UTF-8 exports are rejected before the vault is initialized or imported
+pages are changed. If the error names an invalid export, download a fresh ChatGPT
+export and retry the import.
+
+Re-imports preserve handwritten Notes, including literal marker examples inside a complete Notes block. If a Notes marker is missing, restore it before retrying; the import leaves the affected page unchanged.
+
 ### `wiki chatgpt rollback <run-id>`
 
-Roll back a previously applied ChatGPT import run, removing pages it created and restoring pages it overwrote. No-ops (and reports `alreadyRolledBack`) if the run was already rolled back.
+Roll back a previously applied ChatGPT import run, removing pages it created and restoring pages it overwrote. Pages changed after import are moved under the run's `.openclaw-wiki/import-runs/<run-id>/recovered/` directory instead of being deleted. Recovery paths remain in the command result on retries and later `alreadyRolledBack` responses. Interrupted runs remain `rolling_back` while target recovery or derived-artifact compilation is incomplete. A persisted process-restart fence separates those phases: after it, retries rebuild indexes and compiled caches without rewriting source pages or moving later pathname writes. A later normal compile may refresh machine-managed Related blocks. This covers in-process failure and process restart after ordinary filesystem calls return, not kernel or host power-loss ordering.
 
 ### `wiki obsidian ...`
 

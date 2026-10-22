@@ -3,6 +3,7 @@ package ai.openclaw.app.ui.chat
 import ai.openclaw.app.chat.ChatMessageContent
 import ai.openclaw.app.gateway.GatewayLoadedMedia
 import ai.openclaw.app.gateway.GatewayMediaKind
+import ai.openclaw.app.gateway.GatewayPreparingPlaybackInterceptor
 import ai.openclaw.app.i18n.nativeString
 import ai.openclaw.app.ui.design.ClawTheme
 import android.content.Context
@@ -63,6 +64,7 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.session.MediaSession
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.CancellationException
@@ -84,9 +86,7 @@ internal class ChatMediaPlaybackClaims<T>(
 
   fun claim(value: T) {
     if (active === value) return
-    val previous = active
-    active = null
-    previous?.let(release)
+    releaseActive()
     active = value
   }
 
@@ -97,16 +97,64 @@ internal class ChatMediaPlaybackClaims<T>(
     return true
   }
 
-  fun pauseIf(predicate: (T) -> Boolean): Boolean {
-    val current = active?.takeIf(predicate) ?: return false
-    pause(current)
-    return true
+  fun pauseIf(predicate: (T) -> Boolean) {
+    active?.takeIf(predicate)?.let(pause)
   }
 
   fun releaseActive() {
-    val previous = active ?: return
-    active = null
-    release(previous)
+    releaseIf { true }
+  }
+}
+
+internal class ChatMediaSessionLifecycle<T : Any, S : Any>(
+  private val release: (S) -> Unit,
+) {
+  private var activeOwner: T? = null
+  private var activeSession: S? = null
+
+  fun activate(
+    owner: T,
+    create: (T) -> S,
+  ): S {
+    if (activeOwner === owner) return checkNotNull(activeSession)
+    releaseActive()
+    return create(owner).also { session ->
+      activeOwner = owner
+      activeSession = session
+    }
+  }
+
+  fun release(owner: T) {
+    if (activeOwner === owner) releaseActive()
+  }
+
+  private fun releaseActive() {
+    activeSession?.let(release)
+    activeSession = null
+    activeOwner = null
+  }
+}
+
+@OptIn(UnstableApi::class)
+internal fun inlineMediaSessionPlayerCommands(availableCommands: Player.Commands): Player.Commands =
+  availableCommands
+    .buildUpon()
+    .remove(Player.COMMAND_SET_MEDIA_ITEM)
+    .remove(Player.COMMAND_CHANGE_MEDIA_ITEMS)
+    .remove(Player.COMMAND_STOP)
+    .build()
+
+@OptIn(UnstableApi::class)
+private object ChatInlineMediaSessionCallback : MediaSession.Callback {
+  override fun onConnect(
+    session: MediaSession,
+    controller: MediaSession.ControllerInfo,
+  ): MediaSession.ConnectionResult {
+    if (!controller.isTrusted) return MediaSession.ConnectionResult.reject()
+    return MediaSession.ConnectionResult
+      .AcceptedResultBuilder(session, controller)
+      .setAvailablePlayerCommands(inlineMediaSessionPlayerCommands(session.player.availableCommands))
+      .build()
   }
 }
 
@@ -125,6 +173,7 @@ private object ChatMediaPlaybackArbiter {
 
   private val mainHandler = Handler(Looper.getMainLooper())
   private val claims = ChatMediaPlaybackClaims<ActivePlayback>(::pauseAndAbandon, ::stopAndRelease)
+  private val sessions = ChatMediaSessionLifecycle<ExoPlayer, MediaSession>(MediaSession::release)
   private var playbackIntentGeneration = 0L
 
   @Synchronized
@@ -192,17 +241,29 @@ private object ChatMediaPlaybackArbiter {
     }
     val playback = existing ?: ActivePlayback(player = player, onReleased = onReleased).also(claims::claim)
     playback.audioFocus = AudioFocusHandle(manager = audioManager, request = focusRequest)
+    try {
+      sessions.activate(player) { activePlayer ->
+        MediaSession
+          .Builder(context, activePlayer)
+          .setCallback(ChatInlineMediaSessionCallback)
+          .build()
+      }
+    } catch (_: Throwable) {
+      pauseAndAbandon(playback)
+      return false
+    }
     return true
   }
 
   @Synchronized
-  fun pause(player: ExoPlayer): Boolean = claims.pauseIf { it.player === player }
+  fun pause(player: ExoPlayer) = claims.pauseIf { it.player === player }
 
   @Synchronized
   fun release(player: ExoPlayer): Boolean = claims.releaseIf { it.player === player }
 
   private fun pauseAndAbandon(playback: ActivePlayback) {
     playback.player.pause()
+    sessions.release(playback.player)
     playback.audioFocus?.let { focus -> focus.manager.abandonAudioFocusRequest(focus.request) }
     playback.audioFocus = null
   }
@@ -214,41 +275,13 @@ private object ChatMediaPlaybackArbiter {
   }
 }
 
-@Composable
-internal fun ChatAudioPlayerCard(
-  content: ChatMessageContent,
-  playbackBlocked: Boolean,
-  loadMedia: suspend (String, GatewayMediaKind) -> GatewayLoadedMedia?,
-) {
-  ChatMediaPlayerCard(
-    content = content,
-    kind = GatewayMediaKind.Audio,
-    playbackBlocked = playbackBlocked,
-    loadMedia = loadMedia,
-  )
-}
-
-@Composable
-internal fun ChatVideoPlayerCard(
-  content: ChatMessageContent,
-  playbackBlocked: Boolean,
-  loadMedia: suspend (String, GatewayMediaKind) -> GatewayLoadedMedia?,
-) {
-  ChatMediaPlayerCard(
-    content = content,
-    kind = GatewayMediaKind.Video,
-    playbackBlocked = playbackBlocked,
-    loadMedia = loadMedia,
-  )
-}
-
 @OptIn(UnstableApi::class)
 @Composable
-private fun ChatMediaPlayerCard(
+internal fun ChatMediaPlayerCard(
   content: ChatMessageContent,
   kind: GatewayMediaKind,
   playbackBlocked: Boolean,
-  loadMedia: suspend (String, GatewayMediaKind) -> GatewayLoadedMedia?,
+  loadMedia: suspend (String, GatewayMediaKind, Boolean) -> GatewayLoadedMedia?,
 ) {
   val context = LocalContext.current
   val lifecycleOwner = LocalLifecycleOwner.current
@@ -267,11 +300,14 @@ private fun ChatMediaPlayerCard(
     released: ExoPlayer,
     releasedFile: File?,
   ) {
-    if (player === released) player = null
+    if (player === released) {
+      player = null
+      loading = false
+      isPlaying = false
+      positionMs = 0L
+    }
     if (tempFile === releasedFile) tempFile = null
     releasedFile?.delete()
-    isPlaying = false
-    positionMs = 0L
   }
 
   fun disposeUnclaimedPlayer(
@@ -293,21 +329,6 @@ private fun ChatMediaPlayerCard(
       intentGeneration = intentGeneration,
       onReleased = { clearPlayerState(requested, requestedFile) },
     )
-
-  fun registerPrepared(
-    prepared: ExoPlayer,
-    preparedFile: File?,
-    intentGeneration: Long,
-  ): Boolean =
-    ChatMediaPlaybackArbiter.registerPrepared(
-      player = prepared,
-      intentGeneration = intentGeneration,
-      onReleased = { clearPlayerState(prepared, preparedFile) },
-    )
-
-  fun pause() {
-    player?.let(ChatMediaPlaybackArbiter::pause)
-  }
 
   fun play() {
     if (playbackBlocked) return
@@ -337,7 +358,7 @@ private fun ChatMediaPlayerCard(
     scope.launch {
       val loaded =
         try {
-          loadMedia(artifactId, kind)
+          loadMedia(artifactId, kind, content.playback == "transcode")
         } catch (error: CancellationException) {
           throw error
         } catch (_: Throwable) {
@@ -380,6 +401,7 @@ private fun ChatMediaPlayerCard(
           }
 
           override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == Player.STATE_READY) loading = false
             if (playbackState == Player.STATE_ENDED) {
               ChatMediaPlaybackArbiter.pause(created)
             }
@@ -394,8 +416,14 @@ private fun ChatMediaPlayerCard(
         },
       )
       player = created
-      loading = false
-      if (!registerPrepared(created, prepared.tempFile, intentGeneration)) {
+      if (content.playback != "transcode") loading = false
+      if (
+        !ChatMediaPlaybackArbiter.registerPrepared(
+          player = created,
+          intentGeneration = intentGeneration,
+          onReleased = { clearPlayerState(created, prepared.tempFile) },
+        )
+      ) {
         disposeUnclaimedPlayer(created, prepared.tempFile)
         return@launch
       }
@@ -443,26 +471,21 @@ private fun ChatMediaPlayerCard(
     }
   }
 
-  if (kind == GatewayMediaKind.Video) {
-    VideoPlayerSurface(
+  val presentation =
+    MediaPlaybackPresentation(
       content = content,
-      player = player,
       loading = loading,
       isPlaying = isPlaying,
       playbackBlocked = playbackBlocked,
       error = error,
-      onToggle = { if (isPlaying) pause() else play() },
+      onToggle = { if (isPlaying) player?.let(ChatMediaPlaybackArbiter::pause) else play() },
     )
+  if (kind == GatewayMediaKind.Video) {
+    presentation.VideoPlayerSurface(player)
   } else {
-    AudioPlayerSurface(
-      content = content,
-      loading = loading,
-      isPlaying = isPlaying,
-      playbackBlocked = playbackBlocked,
-      error = error,
+    presentation.AudioPlayerSurface(
       positionMs = positionMs,
       durationMs = durationMs,
-      onToggle = { if (isPlaying) pause() else play() },
       onSeek = { value ->
         val target = value.toLong().coerceIn(0L, durationMs.coerceAtLeast(0L))
         positionMs = target
@@ -473,16 +496,19 @@ private fun ChatMediaPlayerCard(
   }
 }
 
+private data class MediaPlaybackPresentation(
+  val content: ChatMessageContent,
+  val loading: Boolean,
+  val isPlaying: Boolean,
+  val playbackBlocked: Boolean,
+  val error: String?,
+  val onToggle: () -> Unit,
+)
+
 @Composable
-private fun AudioPlayerSurface(
-  content: ChatMessageContent,
-  loading: Boolean,
-  isPlaying: Boolean,
-  playbackBlocked: Boolean,
-  error: String?,
+private fun MediaPlaybackPresentation.AudioPlayerSurface(
   positionMs: Long,
   durationMs: Long,
-  onToggle: () -> Unit,
   onSeek: (Float) -> Unit,
   seekEnabled: Boolean,
 ) {
@@ -525,15 +551,14 @@ private fun AudioPlayerSurface(
             style = ClawTheme.type.body,
             color = ClawTheme.colors.text,
           )
-          val status = error ?: if (playbackBlocked) nativeString("Paused for voice playback") else null
-          status?.let { Text(it, style = ClawTheme.type.caption, color = ClawTheme.colors.textMuted) }
+          MediaPlaybackStatus()
         }
       }
       Slider(
         value = positionMs.coerceIn(0L, durationMs.coerceAtLeast(0L)).toFloat(),
         onValueChange = onSeek,
         valueRange = 0f..durationMs.coerceAtLeast(1L).toFloat(),
-        enabled = seekEnabled && durationMs > 0L && playerControlsAvailable(error, playbackBlocked),
+        enabled = seekEnabled && durationMs > 0L && error == null && !playbackBlocked,
       )
       Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(formatVoiceNoteDuration(positionMs), style = ClawTheme.type.caption, color = ClawTheme.colors.textMuted)
@@ -545,15 +570,7 @@ private fun AudioPlayerSurface(
 
 @OptIn(UnstableApi::class)
 @Composable
-private fun VideoPlayerSurface(
-  content: ChatMessageContent,
-  player: ExoPlayer?,
-  loading: Boolean,
-  isPlaying: Boolean,
-  playbackBlocked: Boolean,
-  error: String?,
-  onToggle: () -> Unit,
-) {
+private fun MediaPlaybackPresentation.VideoPlayerSurface(player: ExoPlayer?) {
   val ratio =
     remember(content.width, content.height) {
       val width = content.width?.takeIf { it > 0 }
@@ -602,16 +619,21 @@ private fun VideoPlayerSurface(
       style = ClawTheme.type.caption,
       color = ClawTheme.colors.textMuted,
     )
-    (error ?: if (playbackBlocked) nativeString("Paused for voice playback") else null)?.let {
-      Text(it, style = ClawTheme.type.caption, color = ClawTheme.colors.textMuted)
-    }
+    MediaPlaybackStatus()
   }
 }
 
-private fun playerControlsAvailable(
-  error: String?,
-  playbackBlocked: Boolean,
-): Boolean = error == null && !playbackBlocked
+@Composable
+private fun MediaPlaybackPresentation.MediaPlaybackStatus() {
+  val status =
+    when {
+      error != null -> error
+      loading && content.playback == "transcode" -> nativeString("Preparing playback…")
+      playbackBlocked -> nativeString("Paused for voice playback")
+      else -> null
+    }
+  status?.let { Text(it, style = ClawTheme.type.caption, color = ClawTheme.colors.textMuted) }
+}
 
 @OptIn(UnstableApi::class)
 private suspend fun prepareMediaSource(
@@ -627,16 +649,20 @@ private suspend fun prepareMediaSource(
         headers = loaded.headers,
         client = loaded.client,
         tempFile = file,
+        retryPreparingPlayback = false,
       )
     }
-    is GatewayLoadedMedia.Streaming ->
+
+    is GatewayLoadedMedia.Streaming -> {
       PreparedMediaSource(
         uri = loaded.url,
         mimeType = loaded.mimeType,
         headers = loaded.headers,
         client = loaded.client,
         tempFile = null,
+        retryPreparingPlayback = loaded.retryPreparingPlayback,
       )
+    }
   }
 }
 
@@ -652,11 +678,9 @@ private suspend fun writeBufferedMediaFile(
         file.writeBytes(bytes)
       }
     }
-  } catch (error: CancellationException) {
+  } catch (error: Throwable) {
     withContext(NonCancellable + Dispatchers.IO) { created?.delete() }
-    throw error
-  } catch (_: Throwable) {
-    withContext(NonCancellable + Dispatchers.IO) { created?.delete() }
+    if (error is CancellationException) throw error
     null
   }
 }
@@ -666,7 +690,16 @@ private fun buildMediaPlayer(
   context: Context,
   source: PreparedMediaSource,
 ): ExoPlayer {
-  val httpFactory = OkHttpDataSource.Factory(source.client).setDefaultRequestProperties(source.headers)
+  val client =
+    if (source.retryPreparingPlayback) {
+      source.client
+        .newBuilder()
+        .addInterceptor(GatewayPreparingPlaybackInterceptor())
+        .build()
+    } else {
+      source.client
+    }
+  val httpFactory = OkHttpDataSource.Factory(client).setDefaultRequestProperties(source.headers)
   val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
   val player =
     ExoPlayer
@@ -698,6 +731,7 @@ private data class PreparedMediaSource(
   val headers: Map<String, String>,
   val client: okhttp3.OkHttpClient,
   val tempFile: File?,
+  val retryPreparingPlayback: Boolean,
 )
 
 internal fun ChatMessageContent.isVideoAttachment(): Boolean = type == "video" || mimeType?.startsWith("video/") == true

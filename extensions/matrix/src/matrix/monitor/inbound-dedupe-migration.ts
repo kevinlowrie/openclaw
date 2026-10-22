@@ -1,46 +1,22 @@
-// Legacy-source readers and importer for the one-time doctor migration of
-// pre-claimable-dedupe inbound replay markers. Losing those markers would
-// re-dispatch already-handled events on the first stale /sync or decrypt
-// replay after upgrade. Two shipped sources exist:
-// - >=2026.6 tags persisted rows in each account storage root's SQLite DB
-//   (namespace `inbound-dedupe`, key `<accountId>:<sha256>`, value
-//   `{roomId, eventId, ts}`), plus `inbound-dedupe-migrations` import markers.
-// - <=2026.5 tags wrote `inbound-dedupe.json` beside the account sync store;
-//   the retired runtime importer read it lazily, so upgrades that skip the
-//   SQLite era can still carry the raw file.
-// The PluginDoctorStateMigration itself lives in doctor-contract-api.ts, which
-// also owns the legacy-file archival write.
 import { createHash } from "node:crypto";
-import type { Dirent } from "node:fs";
-import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  createPersistentDedupeImportEntry,
-  type PersistentDedupeEntry,
-} from "openclaw/plugin-sdk/persistent-dedupe";
-import type { PluginDoctorStateMigrationContext } from "openclaw/plugin-sdk/runtime-doctor";
-import { isRecord } from "../../record-shared.js";
-import { normalizeMatrixStorageMetadata } from "../client/storage.js";
-import {
-  buildMatrixInboundDedupeEventKey,
-  MATRIX_INBOUND_DEDUPE_STATE_MAX_ENTRIES,
-  MATRIX_INBOUND_DEDUPE_TTL_MS,
-  resolveMatrixInboundDedupeStateNamespace,
-} from "./inbound-dedupe.js";
+import type { DatabaseSync } from "node:sqlite";
+import type {
+  PluginDoctorStateMigration,
+  PluginDoctorStateMigrationContext,
+} from "openclaw/plugin-sdk/runtime-doctor-migrations";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { describeRetiredMatrixState } from "../retired-state.js";
+import { walkMatrixStateFiles } from "../state-layout-walk.js";
 
 const LEGACY_SQLITE_NAMESPACE = "inbound-dedupe";
-const LEGACY_SQLITE_MAX_ENTRIES = 20_000;
 const LEGACY_MARKERS_NAMESPACE = "inbound-dedupe-migrations";
-const LEGACY_MARKERS_MAX_ENTRIES = 1_000;
-const LEGACY_JSON_VERSION = 1;
-const STORAGE_META_FILENAME = "storage-meta.json";
+const MATRIX_PLUGIN_ID = "matrix";
+const MIGRATION_COMPLETION_NAMESPACE = "inbound-dedupe-migration-state";
+const MIGRATION_COMPLETION_KEY = "sqlite-json-to-claimable-v1";
+const STATE_DATABASE_RELATIVE_PATH = path.join("state", "openclaw.sqlite");
 
-export const MATRIX_LEGACY_INBOUND_DEDUPE_FILENAME = "inbound-dedupe.json";
-
-export type MatrixInboundDedupeMigrationIo = {
-  context: PluginDoctorStateMigrationContext;
-  env: NodeJS.ProcessEnv;
-};
+const MATRIX_LEGACY_INBOUND_DEDUPE_FILENAME = "inbound-dedupe.json";
 
 export type LegacyInboundDedupeMarker = {
   accountId: string;
@@ -49,59 +25,123 @@ export type LegacyInboundDedupeMarker = {
   ts: number;
 };
 
-export async function collectMatrixInboundDedupeSources(stateDir: string): Promise<{
+type MatrixInboundDedupeSourceRoots = {
   sqliteRoots: string[];
-  jsonRoots: string[];
-}> {
-  const matrixRoot = path.join(stateDir, "matrix");
+};
+
+type MatrixInboundDedupeSourceCensus =
+  | ({ status: "complete" } & MatrixInboundDedupeSourceRoots)
+  | ({ status: "incomplete"; warnings: string[] } & MatrixInboundDedupeSourceRoots);
+
+type LegacySqliteRow = {
+  namespace: string;
+  entry_key: string;
+  value_json: string;
+  expires_at: number | bigint | null;
+};
+
+type MatrixInboundDedupeMigrationCompletion = {
+  version: 1;
+  completedAt: number;
+};
+
+function openMatrixInboundDedupeMigrationCompletionStore(
+  context: PluginDoctorStateMigrationContext,
+  env: NodeJS.ProcessEnv,
+) {
+  return context.openPluginStateKeyedStore<MatrixInboundDedupeMigrationCompletion>({
+    namespace: MIGRATION_COMPLETION_NAMESPACE,
+    maxEntries: 4,
+    overflowPolicy: "reject-new",
+    env,
+  });
+}
+
+export async function hasCompletedMatrixInboundDedupeMigration(
+  context: PluginDoctorStateMigrationContext,
+  env: NodeJS.ProcessEnv,
+): Promise<boolean> {
+  const marker = await openMatrixInboundDedupeMigrationCompletionStore(context, env).lookup(
+    MIGRATION_COMPLETION_KEY,
+  );
+  return (
+    isRecord(marker) &&
+    marker.version === 1 &&
+    typeof marker.completedAt === "number" &&
+    Number.isFinite(marker.completedAt) &&
+    marker.completedAt >= 0
+  );
+}
+
+export async function recordMatrixInboundDedupeMigrationCompletion(
+  context: PluginDoctorStateMigrationContext,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  await openMatrixInboundDedupeMigrationCompletionStore(context, env).register(
+    MIGRATION_COMPLETION_KEY,
+    { version: 1, completedAt: Date.now() },
+  );
+}
+
+export async function collectMatrixInboundDedupeSources(
+  stateDir: string,
+): Promise<MatrixInboundDedupeSourceCensus> {
+  const matrixRoot = path.resolve(stateDir, "matrix");
   const sqliteRoots = new Set<string>();
-  const jsonRoots = new Set<string>();
-  async function visit(dir: string): Promise<void> {
-    let entries: Dirent[];
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const entryPath = path.join(dir, entry.name);
-      if (entry.isFile()) {
-        // Legacy per-root dedupe rows live in `<storageRoot>/state/openclaw.sqlite`.
-        if (entry.name === "openclaw.sqlite" && path.basename(dir) === "state") {
-          sqliteRoots.add(path.dirname(dir));
-        } else if (entry.name === MATRIX_LEGACY_INBOUND_DEDUPE_FILENAME) {
-          jsonRoots.add(dir);
-        }
-        continue;
-      }
-      if (entry.isDirectory()) {
-        await visit(entryPath);
-      }
+  const { entries, failedDirs } = await walkMatrixStateFiles(
+    stateDir,
+    (name, depth) =>
+      ((depth === 0 || depth === 2 || depth === 4) &&
+        name === MATRIX_LEGACY_INBOUND_DEDUPE_FILENAME) ||
+      (depth === 5 && name === "openclaw.sqlite"),
+    [0, 2, 4],
+  );
+  for (const entry of entries) {
+    if (entry.name === MATRIX_LEGACY_INBOUND_DEDUPE_FILENAME) {
+      throw new Error(describeRetiredMatrixState(entry.path));
+    } else {
+      sqliteRoots.add(path.dirname(path.dirname(entry.path)));
     }
   }
-  await visit(matrixRoot);
-  const matrixRootResolved = path.resolve(matrixRoot);
-  const isAccountRoot = (root: string) => path.resolve(root) !== matrixRootResolved;
-  return {
+  const warnings = failedDirs.map(
+    ({ path: directory, error }) =>
+      `Failed scanning Matrix inbound dedupe sources under ${directory}: ${String(error)}`,
+  );
+  const isAccountRoot = (root: string) => root !== matrixRoot;
+  const roots = {
     sqliteRoots: [...sqliteRoots].filter(isAccountRoot).toSorted(),
-    jsonRoots: [...jsonRoots].filter(isAccountRoot).toSorted(),
   };
+  return warnings.length === 0
+    ? { status: "complete", ...roots }
+    : { status: "incomplete", ...roots, warnings };
 }
 
-function openLegacySqliteStore(io: MatrixInboundDedupeMigrationIo, storageRootDir: string) {
-  return io.context.openPluginStateKeyedStore<unknown>({
-    namespace: LEGACY_SQLITE_NAMESPACE,
-    maxEntries: LEGACY_SQLITE_MAX_ENTRIES,
-    env: { ...io.env, OPENCLAW_STATE_DIR: storageRootDir },
-  });
+function selectLegacySqliteRows(db: DatabaseSync): LegacySqliteRow[] {
+  const table = db
+    .prepare(
+      `SELECT 1 AS present
+       FROM sqlite_master
+       WHERE type = 'table' AND name = 'plugin_state_entries'`,
+    )
+    .get();
+  if (!table) {
+    return [];
+  }
+  return db
+    .prepare(
+      `SELECT namespace, entry_key, value_json, expires_at
+       FROM plugin_state_entries
+       WHERE plugin_id = ? AND namespace IN (?, ?)
+       ORDER BY namespace ASC, created_at ASC, entry_key ASC`,
+    )
+    .all(MATRIX_PLUGIN_ID, LEGACY_SQLITE_NAMESPACE, LEGACY_MARKERS_NAMESPACE) as LegacySqliteRow[];
 }
 
-function openLegacyMarkersStore(io: MatrixInboundDedupeMigrationIo, storageRootDir: string) {
-  return io.context.openPluginStateKeyedStore<unknown>({
-    namespace: LEGACY_MARKERS_NAMESPACE,
-    maxEntries: LEGACY_MARKERS_MAX_ENTRIES,
-    env: { ...io.env, OPENCLAW_STATE_DIR: storageRootDir },
-  });
+function isLegacySqliteRowExpired(row: LegacySqliteRow, now: number): boolean {
+  if (typeof row.expires_at === "bigint") {
+    return row.expires_at <= BigInt(now);
+  }
+  return row.expires_at !== null && row.expires_at <= now;
 }
 
 function normalizeLegacyTimestamp(raw: unknown): number | null {
@@ -140,155 +180,199 @@ function parseLegacySqliteRow(row: {
   return { accountId, roomId, eventId, ts };
 }
 
-/** Reads one storage root's legacy SQLite dedupe rows; throws on store errors. */
+/**
+ * Reads one storage root's legacy SQLite dedupe rows without opening it through
+ * the current state runtime. Historical per-account databases can predate the
+ * current core schema, and detection must not upgrade them merely to inspect
+ * these retired plugin-state namespaces.
+ */
 export async function readLegacyInboundDedupeSqliteSource(
-  io: MatrixInboundDedupeMigrationIo,
   storageRootDir: string,
 ): Promise<{ markers: LegacyInboundDedupeMarker[]; legacyRowCount: number }> {
-  const rows = await openLegacySqliteStore(io, storageRootDir).entries();
-  const markerRows = await openLegacyMarkersStore(io, storageRootDir).entries();
-  const markers: LegacyInboundDedupeMarker[] = [];
-  for (const row of rows) {
-    const marker = parseLegacySqliteRow(row);
-    if (marker) {
-      markers.push(marker);
-    }
-  }
-  return { markers, legacyRowCount: rows.length + markerRows.length };
-}
-
-/** Clears one storage root's retired legacy dedupe namespaces after import. */
-export async function retireLegacyInboundDedupeSqliteRows(
-  io: MatrixInboundDedupeMigrationIo,
-  storageRootDir: string,
-): Promise<void> {
-  await openLegacySqliteStore(io, storageRootDir).clear();
-  await openLegacyMarkersStore(io, storageRootDir).clear();
-}
-
-async function resolveJsonRootAccountId(storageRootDir: string): Promise<string> {
-  // The JSON era predates the per-root SQLite stores, so account identity comes
-  // from storage-meta.json (or its doctor-archived copy when the metadata
-  // migration already ran). Pre-metadata roots belong to the legacy single
-  // account, which used the literal "default" account id.
-  for (const filename of [STORAGE_META_FILENAME, `${STORAGE_META_FILENAME}.migrated`]) {
-    try {
-      const metadata = normalizeMatrixStorageMetadata(
-        JSON.parse(await fs.readFile(path.join(storageRootDir, filename), "utf8")) as unknown,
-      );
-      if (metadata?.accountId) {
-        return metadata.accountId;
-      }
-    } catch {
-      // Try the next metadata source.
-    }
-  }
-  return "default";
-}
-
-/**
- * Reads one storage root's legacy inbound-dedupe.json markers. Throws on file
- * read errors so a transiently unreadable file is never retired unread, and
- * returns null for malformed content so the caller can archive it explicitly.
- */
-export async function readLegacyInboundDedupeJsonSource(
-  storageRootDir: string,
-): Promise<LegacyInboundDedupeMarker[] | null> {
-  const jsonPath = path.join(storageRootDir, MATRIX_LEGACY_INBOUND_DEDUPE_FILENAME);
-  const raw = await fs.readFile(jsonPath, "utf8");
-  let parsed: unknown;
+  const { openNodeSqliteDatabase } = await import("openclaw/plugin-sdk/sqlite-worker-runtime");
+  const databasePath = path.join(storageRootDir, STATE_DATABASE_RELATIVE_PATH);
+  const db = openNodeSqliteDatabase(databasePath, { readOnly: true });
   try {
-    parsed = JSON.parse(raw) as unknown;
-  } catch {
-    return null;
-  }
-  if (
-    !isRecord(parsed) ||
-    parsed.version !== LEGACY_JSON_VERSION ||
-    !Array.isArray(parsed.entries)
-  ) {
-    return null;
-  }
-  const accountId = await resolveJsonRootAccountId(storageRootDir);
-  const markers: LegacyInboundDedupeMarker[] = [];
-  for (const entry of parsed.entries) {
-    if (!isRecord(entry) || typeof entry.key !== "string") {
-      continue;
+    const rows = selectLegacySqliteRows(db);
+    const markers: LegacyInboundDedupeMarker[] = [];
+    const now = Date.now();
+    for (const row of rows) {
+      // The keyed-store reader filtered expired rows before decoding them. We
+      // still count that residue so doctor can retire it, but it has no replay
+      // value and malformed expired JSON must not block the whole root.
+      if (isLegacySqliteRowExpired(row, now)) {
+        continue;
+      }
+      // The keyed-store reader parsed every value, including import-marker
+      // values. Keep that fail-closed behavior so corrupt sources are not
+      // retired unread.
+      const value = JSON.parse(row.value_json) as unknown;
+      if (row.namespace !== LEGACY_SQLITE_NAMESPACE) {
+        continue;
+      }
+      const marker = parseLegacySqliteRow({ key: row.entry_key, value });
+      if (marker) {
+        markers.push(marker);
+      }
     }
-    // Legacy JSON keys are `roomId|eventId`; event ids never contain "|".
-    const separator = entry.key.indexOf("|");
-    if (separator <= 0) {
-      continue;
-    }
-    const roomId = entry.key.slice(0, separator).trim();
-    const eventId = entry.key.slice(separator + 1).trim();
-    const ts = normalizeLegacyTimestamp(entry.ts);
-    if (!roomId || !eventId || ts === null) {
-      continue;
-    }
-    markers.push({ accountId, roomId, eventId, ts });
+    return { markers, legacyRowCount: rows.length };
+  } finally {
+    db.close();
   }
-  return markers;
 }
 
-/**
- * Imports the globally newest legacy markers into the claimable-dedupe store.
- * Never exceeds capacity: eviction is by row creation time, so letting fresh
- * imports overflow the namespace would evict the newer rows the runtime
- * committed since the upgrade. Throws on store errors so the caller keeps the
- * legacy sources for the next doctor attempt.
- */
-export async function importNewestInboundDedupeMarkers(params: {
-  io: MatrixInboundDedupeMigrationIo;
+/** Deletes only the two retired Matrix namespaces after a successful import. */
+export async function retireLegacyInboundDedupeSqliteRows(storageRootDir: string): Promise<void> {
+  const { openNodeSqliteDatabase, runSqliteImmediateTransactionSync } =
+    await import("openclaw/plugin-sdk/sqlite-worker-runtime");
+  const databasePath = path.join(storageRootDir, STATE_DATABASE_RELATIVE_PATH);
+  const db = openNodeSqliteDatabase(databasePath);
+  try {
+    // Plan outside the write transaction, then re-read after BEGIN IMMEDIATE
+    // before deleting. The predicates intentionally cannot touch other Matrix
+    // namespaces or another plugin's rows.
+    if (selectLegacySqliteRows(db).length === 0) {
+      return;
+    }
+    runSqliteImmediateTransactionSync(db, () => {
+      if (selectLegacySqliteRows(db).length === 0) {
+        return;
+      }
+      db.prepare(
+        `DELETE FROM plugin_state_entries
+         WHERE plugin_id = ? AND namespace IN (?, ?)`,
+      ).run(MATRIX_PLUGIN_ID, LEGACY_SQLITE_NAMESPACE, LEGACY_MARKERS_NAMESPACE);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+/** Import committed replay markers as ingress tombstones without replaying payloads. */
+export async function importInboundDedupeMarkersToIngress(params: {
+  context: PluginDoctorStateMigrationContext;
   markers: Iterable<LegacyInboundDedupeMarker>;
   now?: number;
-  stateMaxEntries?: number;
 }): Promise<{ imported: number; total: number }> {
+  const openQueue = resolveMatrixIngressQueueOpener(params.context);
+  const queues = new Map<string, ReturnType<typeof openQueue>>();
   const now = params.now ?? Date.now();
-  const stateMaxEntries = params.stateMaxEntries ?? MATRIX_INBOUND_DEDUPE_STATE_MAX_ENTRIES;
-  const newestByKey = new Map<string, LegacyInboundDedupeMarker & { key: string }>();
+  const newestByKey = new Map<string, LegacyInboundDedupeMarker>();
   for (const marker of params.markers) {
-    const key = buildMatrixInboundDedupeEventKey(marker);
-    if (!key) {
+    const accountId = marker.accountId.trim() || "default";
+    const eventId = marker.eventId.trim();
+    if (!marker.roomId.trim() || !eventId) {
       continue;
     }
+    const key = JSON.stringify([accountId, eventId]);
     const existing = newestByKey.get(key);
     if (!existing || marker.ts > existing.ts) {
-      newestByKey.set(key, { ...marker, key });
+      newestByKey.set(key, { ...marker, accountId, eventId });
     }
   }
-  // Newest first so the capacity limit drops the least replay-relevant markers.
-  const markers = [...newestByKey.values()].toSorted((left, right) => right.ts - left.ts);
-  const store = params.io.context.openPluginStateKeyedStore<PersistentDedupeEntry>({
-    namespace: resolveMatrixInboundDedupeStateNamespace(),
-    maxEntries: stateMaxEntries,
-    defaultTtlMs: MATRIX_INBOUND_DEDUPE_TTL_MS,
-    env: params.io.env,
-  });
-  let capacity = Math.max(0, stateMaxEntries - (await store.entries()).length);
   let imported = 0;
-  for (const marker of markers) {
-    if (capacity <= 0) {
-      break;
-    }
-    const remainingTtlMs = MATRIX_INBOUND_DEDUPE_TTL_MS - (now - marker.ts);
-    if (remainingTtlMs <= 0) {
+  for (const marker of newestByKey.values()) {
+    if (now - marker.ts >= MATRIX_INBOUND_DEDUPE_TTL_MS) {
       continue;
     }
-    const entry = createPersistentDedupeImportEntry({
-      key: marker.key,
-      seenAt: marker.ts,
-      ttlMs: Math.max(1, Math.floor(remainingTtlMs)),
-    });
-    // Rows committed after the upgrade are newer than any legacy marker, so
-    // registerIfAbsent keeps them and only fills the missing keys.
-    const registered = await store.registerIfAbsent(entry.key, entry.value, {
-      ttlMs: entry.ttlMs ?? MATRIX_INBOUND_DEDUPE_TTL_MS,
-    });
-    if (registered) {
-      imported += 1;
-      capacity -= 1;
+    let queue = queues.get(marker.accountId);
+    if (!queue) {
+      queue = openQueue({ accountId: marker.accountId });
+      queues.set(marker.accountId, queue);
+    }
+    // Existing ingress claims and terminal rows already own this event identity.
+    // complete(id) creates only an absent tombstone or settles a pending replay.
+    if (await queue.complete(marker.eventId, { completedAt: marker.ts })) {
+      imported++;
     }
   }
-  return { imported, total: markers.length };
+  return { imported, total: newestByKey.size };
 }
+
+function resolveMatrixIngressQueueOpener(context: PluginDoctorStateMigrationContext) {
+  const openQueue = context.channelIngressQueues?.find(
+    (entry) => entry.channelId === "matrix",
+  )?.openChannelIngressQueue;
+  if (!openQueue) {
+    throw new Error("Matrix ingress migration requires the host-owned ingress queue");
+  }
+  return openQueue;
+}
+
+// These are the released replay guard's persisted namespace and retention, kept
+// only to move its committed identities into the ingress owner's tombstones.
+const MATRIX_INBOUND_DEDUPE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const MATRIX_INBOUND_DEDUPE_STATE_MAX_ENTRIES = 20_000;
+const MATRIX_INBOUND_DEDUPE_STATE_NAMESPACE = `matrix.inbound-dedupe.${createHash("sha256").update("global").digest("hex").slice(0, 32)}`;
+
+function readReplayGuardRows(context: PluginDoctorStateMigrationContext) {
+  const read = context.readPluginStateEntriesInKeyRange;
+  if (!read) {
+    throw new Error("Matrix ingress migration requires the host-owned plugin-state reader");
+  }
+  const rows: ReturnType<typeof read> = [];
+  let after: string | undefined;
+  for (;;) {
+    const batch = read(MATRIX_INBOUND_DEDUPE_STATE_NAMESPACE, { prefix: "", after, limit: 512 });
+    rows.push(...batch);
+    const last = batch.at(-1);
+    if (batch.length < 512 || !last) {
+      return rows;
+    }
+    after = last.key;
+  }
+}
+
+function parseReplayGuardMarker(value: unknown): LegacyInboundDedupeMarker | null {
+  if (!isRecord(value) || typeof value.key !== "string") {
+    return null;
+  }
+  const [accountId, roomId, eventId, extra] = value.key.split("\0");
+  const ts = normalizeLegacyTimestamp(value.seenAt);
+  return accountId && roomId && eventId && extra === undefined && ts !== null
+    ? { accountId, roomId, eventId, ts }
+    : null;
+}
+
+export const matrixReplayGuardIngressMigration: PluginDoctorStateMigration = {
+  id: "matrix-replay-guard-to-ingress",
+  label: "Matrix inbound replay markers",
+  collectBackupResources: () => [],
+  detectLegacyState({ context }) {
+    return readReplayGuardRows(context).length > 0
+      ? { preview: ["Move committed Matrix event identities into the durable ingress spool."] }
+      : null;
+  },
+  async migrateLegacyState({ context, env }) {
+    const rows = readReplayGuardRows(context);
+    if (rows.length === 0) {
+      return { changes: [], warnings: [] };
+    }
+    // Only rows carrying a usable replay identity can become tombstones.
+    const markers = rows.flatMap((row) => {
+      const marker = parseReplayGuardMarker(row.value);
+      return marker ? [marker] : [];
+    });
+    const result = await importInboundDedupeMarkersToIngress({
+      context,
+      markers,
+    });
+    const store = context.openPluginStateKeyedStore({
+      namespace: MATRIX_INBOUND_DEDUPE_STATE_NAMESPACE,
+      maxEntries: MATRIX_INBOUND_DEDUPE_STATE_MAX_ENTRIES,
+      defaultTtlMs: MATRIX_INBOUND_DEDUPE_TTL_MS,
+      env,
+    });
+    // Startup migrations hold exclusive state ownership. Delete sources only
+    // after every tombstone persisted so interruption can retry idempotently.
+    for (const row of rows) {
+      await store.delete(row.key);
+    }
+    return {
+      changes: [
+        `Migrated Matrix replay markers to the durable ingress spool (${result.imported} of ${result.total} entries)`,
+      ],
+      warnings: [],
+    };
+  },
+};

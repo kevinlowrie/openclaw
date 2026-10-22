@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { formatQaGatewayLogsForError, redactQaGatewayDebugText } from "./gateway-log-redaction.js";
+import {
+  createQaGatewayCliError,
+  formatQaGatewayLogsForError,
+  redactQaGatewayDebugText,
+} from "./gateway-log-redaction.js";
+
+const token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 
 describe("gateway log redaction", () => {
   it("redacts raw Telegram bot tokens and Bot API URLs", () => {
-    const token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
     const raw = [
       `gateway echoed ${token}`,
       `POST https://api.telegram.org/bot${token}/sendMessage`,
@@ -17,7 +22,6 @@ describe("gateway log redaction", () => {
   });
 
   it("redacts Telegram bot tokens that cross the bounded-redactor chunk boundary", () => {
-    const token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
     const prefix = `${"x".repeat(16_384 - 5)} `;
     const raw = `${prefix}${token} ${"x".repeat(16_384)}`;
 
@@ -26,37 +30,60 @@ describe("gateway log redaction", () => {
     expect(formatQaGatewayLogsForError(raw)).not.toContain(token);
   });
 
-  it("neutralizes GitHub workflow commands at every line boundary", () => {
+  it("redacts Buzz QA private keys and authorization tags", () => {
+    const privateKey = "01".repeat(32);
+    const authTag = '["auth","pubkey","conditions","signature"]';
     const raw = [
-      "::set-output name=output_dir::/tmp/attacker",
-      "safe",
-      "\r::stop-commands::attacker-token",
-      " \t::error::whitespace-prefixed",
-      "\u00a0::warning::nbsp-prefixed",
-      "\uFEFF::notice::bom-prefixed",
-      "\u000b::debug::vertical-tab-prefixed",
-      "\u000c::error::form-feed-prefixed",
-      "\u2028::warning::line-separator-prefixed",
-      "\u2029::notice::paragraph-separator-prefixed",
-      "prefix ##[error]legacy command",
+      `privateKey: ${privateKey}`,
+      `authTag: ${authTag}`,
+      `{"privateKey":"${privateKey}"}`,
+      JSON.stringify({ authTag }),
+      `channels.buzz.authTag: ${authTag}`,
+      'channels.buzz.authTag: [\n  "auth",\n  "pubkey",\n  "conditions",\n  "signature"\n]',
+      "channels.buzz.authTag: [\n  'auth',\n  'pubkey',\n  'conditions',\n  'escaped\\'signature'\n]",
     ].join("\n");
 
-    expect(redactQaGatewayDebugText(raw)).toBe(
+    const redacted = redactQaGatewayDebugText(raw);
+    expect(redacted).not.toContain(privateKey);
+    expect(redacted).not.toContain(authTag);
+    expect(redacted).not.toContain("signature");
+    expect(redacted.match(/<redacted>/gu)).toHaveLength(7);
+  });
+
+  it("neutralizes GitHub workflow commands at every line boundary", () => {
+    const commands = [
+      ["\r", "stop-commands::attacker-token"],
+      [" \t", "error::whitespace-prefixed"],
+      ["\u00a0", "warning::nbsp-prefixed"],
+      ["\uFEFF", "notice::bom-prefixed"],
+      ["\u000b", "debug::vertical-tab-prefixed"],
+      ["\u000c", "error::form-feed-prefixed"],
+      ["\u2028", "warning::line-separator-prefixed"],
+      ["\u2029", "notice::paragraph-separator-prefixed"],
+    ];
+    const render = (marker: string, legacy: string) =>
       [
-        ": :set-output name=output_dir::/tmp/attacker",
+        `${marker}set-output name=output_dir::/tmp/attacker`,
         "safe",
-        "\r: :stop-commands::attacker-token",
-        " \t: :error::whitespace-prefixed",
-        "\u00a0: :warning::nbsp-prefixed",
-        "\uFEFF: :notice::bom-prefixed",
-        "\u000b: :debug::vertical-tab-prefixed",
-        "\u000c: :error::form-feed-prefixed",
-        "\u2028: :warning::line-separator-prefixed",
-        "\u2029: :notice::paragraph-separator-prefixed",
-        "prefix # #[error]legacy command",
-      ].join("\n"),
-    );
+        ...commands.map(([prefix, command]) => `${prefix}${marker}${command}`),
+        `prefix ${legacy}[error]legacy command`,
+      ].join("\n");
+    const raw = render("::", "##");
+
+    expect(redactQaGatewayDebugText(raw)).toBe(render(": :", "# #"));
     expect(formatQaGatewayLogsForError(raw)).not.toMatch(/(^|[\r\n])[^\S\r\n]*::/u);
     expect(formatQaGatewayLogsForError(raw)).not.toContain("##[");
   });
+
+  it.each([995, 996, 997])(
+    "keeps a CLI truncation boundary inert with %s trailing chars",
+    (padding) => {
+      const raw = `${"context ".repeat(512)}::error::untrusted${"x".repeat(padding)}`;
+      const error = createQaGatewayCliError(raw);
+
+      expect(error.message).toContain("untrusted");
+      expect(error.message.length).toBeLessThanOrEqual(2_048);
+      expect(error.message).not.toMatch(/(^|[\r\n])[^\S\r\n]*::/u);
+    },
+  );
 });

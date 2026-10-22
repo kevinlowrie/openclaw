@@ -2,8 +2,10 @@ import { formatErrorMessage, toErrorObject } from "openclaw/plugin-sdk/error-run
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import type { WizardPrompter } from "openclaw/plugin-sdk/setup";
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
+import { raceWithTimeout } from "openclaw/plugin-sdk/time-runtime";
 import { buildOllamaBaseUrlSsrFPolicy, resolveOllamaApiBase } from "./provider-models.js";
 import { normalizeOllamaModelName } from "./setup-model-selection.js";
+import { readOllamaNdjsonLines } from "./stream-ndjson.js";
 
 const OLLAMA_PULL_RESPONSE_TIMEOUT_MS = 30_000;
 const OLLAMA_PULL_STREAM_IDLE_TIMEOUT_MS = 300_000;
@@ -30,21 +32,19 @@ function formatOllamaPullStatus(status: string): { text: string; hidePercent: bo
 async function readOllamaPullChunkWithIdleTimeout(
   reader: ReadableStreamDefaultReader<Uint8Array>,
 ): Promise<ReadableStreamReadResult<Uint8Array>> {
-  return await new Promise((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
+  return await raceWithTimeout(
+    () =>
+      reader.read().catch((error: unknown) => {
+        throw toErrorObject(error, "Non-Error rejection");
+      }),
+    OLLAMA_PULL_STREAM_IDLE_TIMEOUT_MS,
+    () => {
       void reader.cancel().catch(() => undefined);
-      reject(
-        new Error(
-          `Ollama pull stalled: no data received for ${Math.round(OLLAMA_PULL_STREAM_IDLE_TIMEOUT_MS / 1000)}s`,
-        ),
+      throw new Error(
+        `Ollama pull stalled: no data received for ${Math.round(OLLAMA_PULL_STREAM_IDLE_TIMEOUT_MS / 1000)}s`,
       );
-    }, OLLAMA_PULL_STREAM_IDLE_TIMEOUT_MS);
-
-    void reader
-      .read()
-      .then(resolve, (error: unknown) => reject(toErrorObject(error, "Non-Error rejection")))
-      .finally(() => clearTimeout(timeoutId));
-  });
+    },
+  );
 }
 
 async function pullOllamaModelCore(params: {
@@ -67,7 +67,7 @@ async function pullOllamaModelCore(params: {
       init: {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: modelName }),
+        body: JSON.stringify({ model: modelName }),
       },
       signal: params.signal
         ? AbortSignal.any([responseController.signal, params.signal])
@@ -78,6 +78,9 @@ async function pullOllamaModelCore(params: {
     clearTimeout(responseTimeout);
     try {
       if (!response.ok) {
+        // Capture can retain a cloned tee branch, so cancellation must not delay
+        // the guard's bounded dispatcher release.
+        void response.body?.cancel().catch(() => undefined);
         return { ok: false, message: `Failed to download ${modelName} (HTTP ${response.status})` };
       }
       if (!response.body) {
@@ -85,66 +88,52 @@ async function pullOllamaModelCore(params: {
       }
 
       const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
       const layers = new Map<string, { total: number; completed: number }>();
 
-      const parseLine = (line: string): OllamaPullResult => {
-        const trimmed = line.trim();
-        if (!trimmed) {
+      for await (const line of readOllamaNdjsonLines(reader, {
+        decoder: new TextDecoder(),
+        read: () => readOllamaPullChunkWithIdleTimeout(reader),
+      })) {
+        let chunk: OllamaPullChunk | null;
+        try {
+          chunk = JSON.parse(line) as OllamaPullChunk | null;
+        } catch {
+          // Ignore malformed JSON lines from Ollama, not progress callback failures.
+          continue;
+        }
+        if (!chunk) {
+          continue;
+        }
+        if (chunk.error) {
+          return { ok: false, message: `Download failed: ${chunk.error}` };
+        }
+        if (!chunk.status) {
+          continue;
+        }
+        if (chunk.status === "success") {
           return { ok: true };
         }
-        try {
-          const chunk = JSON.parse(trimmed) as OllamaPullChunk;
-          if (chunk.error) {
-            return { ok: false, message: `Download failed: ${chunk.error}` };
+        if (chunk.total && chunk.completed !== undefined) {
+          layers.set(chunk.status, { total: chunk.total, completed: chunk.completed });
+          const totals = { total: 0, completed: 0 };
+          for (const layer of layers.values()) {
+            totals.total += layer.total;
+            totals.completed += layer.completed;
           }
-          if (!chunk.status) {
-            return { ok: true };
-          }
-          if (chunk.total && chunk.completed !== undefined) {
-            layers.set(chunk.status, { total: chunk.total, completed: chunk.completed });
-            const totals = [...layers.values()].reduce(
-              (sum, layer) => ({
-                total: sum.total + layer.total,
-                completed: sum.completed + layer.completed,
-              }),
-              { total: 0, completed: 0 },
-            );
-            params.onStatus?.(
-              chunk.status,
-              totals.total > 0 ? Math.round((totals.completed / totals.total) * 100) : null,
-            );
-          } else {
-            params.onStatus?.(chunk.status, null);
-          }
-        } catch {
-          // Ignore malformed streaming lines from Ollama.
-        }
-        return { ok: true };
-      };
-
-      for (;;) {
-        const { done, value } = await readOllamaPullChunkWithIdleTimeout(reader);
-        if (done) {
-          return parseLine(buffer);
-        }
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          const parsed = parseLine(line);
-          if (!parsed.ok) {
-            return parsed;
-          }
+          params.onStatus?.(
+            chunk.status,
+            totals.total > 0 ? Math.round((totals.completed / totals.total) * 100) : null,
+          );
+        } else {
+          params.onStatus?.(chunk.status, null);
         }
       }
+      throw new Error("pull stream ended before success");
     } finally {
       await release();
     }
   } catch (err) {
-    const reason = formatErrorMessage(err);
-    return { ok: false, message: `Failed to download ${modelName}: ${reason}` };
+    return { ok: false, message: `Failed to download ${modelName}: ${formatErrorMessage(err)}` };
   } finally {
     clearTimeout(responseTimeout);
   }

@@ -1,55 +1,34 @@
-// Voice Call plugin module owns bounded webhook replay tracking.
+import { createDedupeCache } from "openclaw/plugin-sdk/dedupe-runtime";
 import {
-  isFutureDateTimestampMs,
+  asDateTimestampMs,
   resolveExpiresAtMsFromDurationMs,
 } from "openclaw/plugin-sdk/number-runtime";
 
 const REPLAY_WINDOW_MS = 10 * 60 * 1000;
 const REPLAY_CACHE_MAX_ENTRIES = 10_000;
-const REPLAY_CACHE_PRUNE_INTERVAL = 64;
 
-type WebhookReplayCache = {
-  seenUntil: Map<string, number>;
-  calls: number;
-};
+type WebhookReplayCache = ReturnType<typeof createWebhookReplayCache>;
 
-export function createWebhookReplayCache(): WebhookReplayCache {
-  return { seenUntil: new Map<string, number>(), calls: 0 };
+export function createWebhookReplayCache() {
+  return createDedupeCache({ ttlMs: REPLAY_WINDOW_MS, maxSize: REPLAY_CACHE_MAX_ENTRIES });
 }
 
-function pruneWebhookReplayCache(cache: WebhookReplayCache, now: number): void {
-  for (const [key, expiresAt] of cache.seenUntil) {
-    if (!isFutureDateTimestampMs(expiresAt, { nowMs: now })) {
-      cache.seenUntil.delete(key);
-    }
-  }
-  while (cache.seenUntil.size > REPLAY_CACHE_MAX_ENTRIES) {
-    const oldest = cache.seenUntil.keys().next().value;
-    if (!oldest) {
-      break;
-    }
-    cache.seenUntil.delete(oldest);
-  }
-}
-
-export function markWebhookReplay(cache: WebhookReplayCache, replayKey: string): boolean {
+export function reserveWebhookReplay(cache: WebhookReplayCache, replayKey: string) {
   const now = Date.now();
-  cache.calls += 1;
-  if (cache.calls % REPLAY_CACHE_PRUNE_INTERVAL === 0) {
-    pruneWebhookReplayCache(cache, now);
-  }
-
-  const existing = cache.seenUntil.get(replayKey);
-  if (existing !== undefined && isFutureDateTimestampMs(existing, { nowMs: now })) {
-    return true;
+  if (asDateTimestampMs(now) !== undefined && cache.peek(replayKey, now)) {
+    return { isReplay: true, verifiedRequestKey: replayKey };
   }
 
   const expiresAt = resolveExpiresAtMsFromDurationMs(REPLAY_WINDOW_MS, { nowMs: now });
-  if (expiresAt !== undefined) {
-    cache.seenUntil.set(replayKey, expiresAt);
+  if (expiresAt === undefined) {
+    return { isReplay: false, verifiedRequestKey: replayKey };
   }
-  if (cache.seenUntil.size > REPLAY_CACHE_MAX_ENTRIES) {
-    pruneWebhookReplayCache(cache, now);
-  }
-  return false;
+  const reservation = {};
+  cache.check(replayKey, now, reservation);
+  return {
+    isReplay: false,
+    verifiedRequestKey: replayKey,
+    // An older failed delivery must never clear a newer same-key reservation.
+    releaseReplay: () => cache.delete(replayKey, reservation),
+  };
 }
